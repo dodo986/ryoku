@@ -95,6 +95,16 @@ var bundledPlugins = []pluginDef{
 		Loaded:  "hyprgrass", ConfigSection: "hyprgrass",
 	},
 	{
+		// Loaded from its own block in user.lua (hyprdrive.go), never from
+		// settings.lua; its switch and binds are on Windows > Hyprdrive.
+		ID: "hyprdrive", Name: "Hyprdrive",
+		Desc:   "A mission-control overview of every window, Mosaic layouts and window motion.",
+		Plugin: "hyprdrive", Local: "ryoku/hyprland/plugins/hyprdrive",
+		Package: "ryoku-hyprdrive",
+		Docs:    "https://github.com/ryoku-dev/ryoku/blob/unstable-dev/ryoku/hyprland/plugins/hyprdrive/README.md",
+		Loaded:  "hyprdrive", ConfigSection: "hyprdrive",
+	},
+	{
 		ID: "keysounds", Name: "Key sounds",
 		Desc:   "Plays a keyboard sound on every key press: real switch recordings, or your own samples.",
 		Plugin: "keysounds", Local: "ryoku/hyprland/plugins/keysounds",
@@ -697,6 +707,8 @@ func pluginEnabled(o Overrides, id string) bool {
 		return o.Plugins.BordersPlusPlus.Enabled
 	case "hyprgrass":
 		return o.Plugins.Hyprgrass.Enabled
+	case "hyprdrive":
+		return o.Plugins.Hyprdrive.Enabled
 	}
 	return o.Plugins.Extra[id].Enabled
 }

@@ -1,0 +1,16 @@
+# The build recipe `ryoku-hub desktop plugins rebuild` runs on a checkout or a
+# packaged box, in the format hyprpm reads. The plugin lives in the Ryoku
+# monorepo, so it tracks the Hyprland the repo ships and carries no commit pins.
+# The look bridge (look/) is built by the package, not here: the plugin finds
+# it on PATH.
+
+[repository]
+name = "ryoku-hyprdrive"
+authors = ["Ryoku", "dragos", "yayuuu"]
+description = "Mission-control overview, Mosaic and window motion for Ryoku"
+commit_pins = []
+
+[hyprdrive]
+description = "Mission-control overview, Mosaic and window motion"
+output = "hyprdrive.so"
+build = ["make hyprdrive.so"]

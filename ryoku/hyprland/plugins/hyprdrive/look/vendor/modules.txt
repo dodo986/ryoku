@@ -1,0 +1,6 @@
+# github.com/ryoku-dev/ryoku/docs/lithic/library/go v0.0.0 => ../../../../../docs/lithic/library/go
+## explicit; go 1.26
+github.com/ryoku-dev/ryoku/docs/lithic/library/go/design
+github.com/ryoku-dev/ryoku/docs/lithic/library/go/palette
+github.com/ryoku-dev/ryoku/docs/lithic/library/go/tokens
+# github.com/ryoku-dev/ryoku/docs/lithic/library/go => ../../../../../docs/lithic/library/go

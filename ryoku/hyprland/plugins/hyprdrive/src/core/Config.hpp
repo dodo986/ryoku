@@ -1,0 +1,318 @@
+#pragma once
+
+#include "globals.hpp"
+#include <hyprland/src/helpers/time/Time.hpp>
+
+#include <hyprland/src/config/ConfigManager.hpp>
+#include <hyprland/src/config/ConfigValue.hpp>
+#include <hyprland/src/config/shared/complex/ComplexDataTypes.hpp>
+
+#include <cstdint>
+#include <cstdio>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+
+namespace Hyprdrive::Config {
+
+using TDispatcher       = SDispatchResult (*)(std::string);
+using TGestureKeyword   = Hyprlang::CParseResult (*)(const char* LHS, const char* RHS);
+using TGestureRegistrar   = SDispatchResult (*)(size_t fingerCount, const std::string& direction, const std::string& action, const std::string& mods, float deltaScale,
+                                                bool disableInhibit, const std::string& arg);
+
+enum class ELayout {
+    VERTICAL,
+    HORIZONTAL,
+};
+
+enum class EScrollAction {
+    WORKSPACE,
+    COLUMN,
+};
+
+// What the overview blurs behind the desktop cards (plugin:hyprdrive:backdrop).
+// The cards themselves always show the live desktop; this is only the frost.
+enum class EBackdrop {
+    OFF,       // the static wallpaper darkened, no blur
+    WALLPAPER, // the static wallpaper (BACKGROUND layer) blurred -- the old look
+    SNAPSHOT,  // BACKGROUND + BOTTOM (a live wallpaper) blurred once as it opens
+    LIVE,      // the same, re-blurred as it moves (at most 30 times a second)
+    AUTO,      // LIVE while the wallpaper changes rarely, SNAPSHOT while it animates
+};
+
+// The order of the overview grid's tiles, top left to bottom right
+// (plugin:hyprdrive:overview_tile_order; GridSolve.hpp). Taken when the
+// overview opens and held while it is up.
+enum class ETileOrder {
+    RECENT,   // "recent": the most recently used window first
+    CREATED,  // "created": the order the windows were opened, oldest first
+    POSITION, // "position": tiles placed as the windows sit on the desktop
+};
+// The owner has not chosen the default yet. Changing it is three edits that
+// tests/config_defaults_test.py holds together: this, the literal registered
+// in Config.cpp, and hdpanel's KEY_META.
+inline constexpr ETileOrder OVERVIEW_TILE_ORDER_DEFAULT = ETileOrder::RECENT;
+
+void registerDispatcher(const std::string& name, TDispatcher dispatcher);
+void registerGesture(TGestureRegistrar gestureRegistrar, TGestureKeyword gestureKeyword);
+void registerConfig();
+
+// Keys are spelled as 25-45 character literals at every call site, and the map
+// below is the one thing between a call site and the value. Taking the name as
+// a std::string built a heap allocation per LOOKUP -- several hundred a frame
+// per monitor, all of them for a string that already exists in .rodata. A
+// transparent (heterogeneous) hash and equality let find() hash the characters
+// where they lie; the only std::string that survives is the one a key is first
+// stored under.
+struct SKeyHash {
+    using is_transparent = void;
+
+    size_t operator()(const std::string_view key) const noexcept {
+        return std::hash<std::string_view>{}(key);
+    }
+};
+
+struct SKeyEqual {
+    using is_transparent = void;
+
+    bool operator()(const std::string_view a, const std::string_view b) const noexcept {
+        return a == b;
+    }
+};
+
+// CConfigValue is Hyprland's own caching handle: it holds the pointer-TO-pointer
+// the config manager owns, so one of these survives a reload and costs a double
+// indirection to read. They are created once per key and never erased, and the
+// map stores them by pointer, so the reference handed back stays valid across a
+// rehash -- which is what makes
+//
+//     static auto& VAL = valueRef<Hyprlang::INT>("plugin:hyprdrive:...");
+//
+// legal at a call site, and is how the per-frame helpers in Config.cpp skip even
+// the hash. Do NOT cache what a handle POINTS AT that way: that pointer moves.
+template <typename T>
+CConfigValue<T>& valueRef(const std::string_view name) {
+    static std::unordered_map<std::string, UP<CConfigValue<T>>, SKeyHash, SKeyEqual> values;
+
+    if (const auto IT = values.find(name); IT != values.end())
+        return *IT->second;
+
+    const auto [IT, INSERTED] = values.try_emplace(std::string{name});
+    IT->second                = makeUnique<CConfigValue<T>>(IT->first);
+
+    return *IT->second;
+}
+
+// Set once registerConfigValues() has registered every plugin key. Before
+// that, binding a plugin: key ABORTS Hyprland (CConfigValue::bind) -- and a
+// plugin loaded at startup then aborts every login: 2026-09-29, a read of
+// plugin:hyprdrive:smooth_frames in PLUGIN_INIT crash-looped the session. So an
+// early read gets the type's empty value (and says so) instead of a crash.
+inline bool g_pluginKeysRegistered = false;
+
+inline bool earlyPluginKey(const std::string_view name) {
+    if (g_pluginKeysRegistered || !name.starts_with("plugin:"))
+        return false;
+    std::fprintf(stderr, "[hyprdrive] BUG: config key %.*s read before registration\n", sc<int>(name.size()), name.data());
+    return true;
+}
+
+// A HOT READ: a plugin key read every frame (or every row of a frame) through
+// its handle, bound once, instead of getValue's string hash -- and, for a
+// string, without its copy. Never stale: the handle reads the value's live
+// storage, so a reload and a live `hyprctl eval hl.config(...)` (the settings
+// panel's preview, which fires no signal the plugin could cache on) both show
+// on the very next read, exactly as getValue did. Call sites keep the handle in
+// a function-local static, AFTER this check:
+//
+//     if (!Config::g_pluginKeysRegistered) return <getValue's empty value>;
+//     static auto& VAL = Config::valueRef<Hyprlang::INT>(KEY);
+//
+// (the check first: binding a plugin: key before registration aborts Hyprland).
+
+template <typename T>
+T getValue(const std::string_view name) {
+    using TValue = std::decay_t<T>;
+
+    if (earlyPluginKey(name))
+        return TValue{};
+
+	if constexpr (std::is_same_v<TValue, ::Config::CGradientValueData>) {
+        auto& ref = valueRef<::Config::IComplexConfigValue>(name);
+        if (!ref.good())
+            return {};
+        return *sc<::Config::CGradientValueData*>(ref.ptr());
+    }
+
+    if constexpr (std::is_same_v<TValue, bool>)
+        return *valueRef<Hyprlang::INT>(name) != 0;
+    else if constexpr (std::is_integral_v<TValue> && !std::is_same_v<TValue, bool>)
+        return sc<TValue>(*valueRef<Hyprlang::INT>(name));
+    else if constexpr (std::is_floating_point_v<TValue>)
+        return sc<TValue>(*valueRef<Hyprlang::FLOAT>(name));
+    else
+        return *valueRef<TValue>(name);
+}
+
+// The live gradient, NOT a copy. CGradientValueData owns a colour vector, so
+// getValue<CGradientValueData> is a heap allocation every call -- and the
+// overview asks for the highlight and the shadow colour once per card and once
+// per strip cell, per frame. nullptr when the key is not registered.
+//
+// The returned pointer is derived from the config manager on each call and must
+// not outlive the expression that asked for it: a reload moves the value. Cache
+// the HANDLE (the valueRef overload) at a call site, never this pointer.
+inline const ::Config::CGradientValueData* gradientPtr(CConfigValue<::Config::IComplexConfigValue>& ref) {
+    if (!ref.good())
+        return nullptr;
+
+    auto* const PTR = ref.ptr();
+    return PTR ? sc<::Config::CGradientValueData*>(PTR) : nullptr;
+}
+
+inline const ::Config::CGradientValueData* gradientPtr(const std::string_view name) {
+    return gradientPtr(valueRef<::Config::IComplexConfigValue>(name));
+}
+
+template <typename T>
+T* getValuePtr(const std::string_view name) {
+    return valueRef<T>(name).ptr();
+}
+
+template <typename T>
+void setValue(const std::string_view name, const T& value) {
+    using TValue = std::decay_t<T>;
+
+    if (earlyPluginKey(name))
+        return;
+
+    if constexpr (std::is_same_v<TValue, bool>)
+        *getValuePtr<Hyprlang::INT>(name) = value ? 1 : 0;
+    else if constexpr (std::is_integral_v<TValue> && !std::is_same_v<TValue, bool>)
+        *getValuePtr<Hyprlang::INT>(name) = sc<Hyprlang::INT>(value);
+    else if constexpr (std::is_floating_point_v<TValue>)
+        *getValuePtr<Hyprlang::FLOAT>(name) = sc<Hyprlang::FLOAT>(value);
+    else
+        *getValuePtr<TValue>(name) = value;
+}
+
+int           getGestureDistance();
+float         getGestureDetent();
+bool          getGestureDetentLabel();
+std::string   getGestureDetentSound();
+
+// The desktop's look, as Lithic roles (Theme.cpp over Look.hpp). Chrome is
+// drawn on solid planes with no blur; its corners come from a Lithic cut and
+// the style in use. The window cards keep the window's own corner.
+CHyprColor    highlightColor();      // sel: a mark of place
+CHyprColor    restingBorderColor();  // vein: every hairline at rest
+CHyprColor    highlightForeground(); // onSel: ink on a sel fill
+int           themeRounding();       // decoration:rounding, for the window cards
+float         themeRoundingPower();
+const std::string& themeFontFamily(); // Geologica
+const std::string& themeMonoFamily(); // Martian Mono
+const std::string& glyphFontSetting();
+bool          isLightTheme();
+CHyprColor    themeForeground();
+CHyprColor    themeMutedText();
+CHyprColor    themeFaintText();
+CHyprColor    themeAccent();
+CHyprColor    themeHeading();
+CHyprColor    themeSelection();
+CHyprColor    themeSelectedFill();
+CHyprColor    themeSelectedRing(); // alpha 0: Lithic marks a choice with a wash, not a ring
+CHyprColor    themeSelectedText();
+CHyprColor    themeUrgent();
+CHyprColor    themeAction();    // gold: the one consequential action of a view
+CHyprColor    themeActionInk(); // onGold
+CHyprColor    chromePlate();      // the page plane
+CHyprColor    chromeStroke();     // its hairline; alpha 0 in the round styles
+CHyprColor    chromeCard();       // a group of rows
+CHyprColor    chromeCardStroke();
+CHyprColor    chromeOverlay();    // popovers and menus
+CHyprColor    chromeScrim();
+float         chromeCorner(float cut, float w, float h);
+float         chromeCornerPower();
+
+// Bumped by every reload and every new look, for caches keyed on the theme.
+void          invalidateThemeCache();
+uint64_t      themeGeneration();
+
+
+float         getScale();
+float         getOpenSpeed();
+float         getCloseSpeed();
+int           getWorkspaceGap();
+ELayout       getLayout();
+int           getScrollEventDelay();
+bool          getLeftHanded();
+int           getDragMode();
+int           getDragThreshold();
+
+// GLOBAL ANIMATION SPEED (user, 2026-08-06). One multiplier over every timed
+// thing in the plugin. 1.0 is the shipped feel; 10.0 runs everything at a tenth
+// speed so a single frame can be looked at properly. 0 snaps: every in-flight
+// ease completes on the next sample (Hyprdrive motion toggle).
+//
+// Deliberately applied at the ONE place elapsed time is measured, not by editing
+// durations: every constant in the codebase keeps its real, meaningful value
+// (GNOME's 400ms minimize stays the number 400 and can still be checked against
+// the host), and nothing has to be un-edited afterwards.
+//
+// These four forward to the one animation clock, motion/MotionClock.hpp
+// (Motion::Clock), which defines what the scale means -- 0 included.
+float         animScale();
+bool          motionEnabled();
+
+// Wall-clock ms. Input timing (double-click, drag-hold) must not ride animScale
+// -- at 0 that clock jumps to infinity and would swallow clicks.
+float         realElapsedMs(const Time::steady_tp& since);
+
+// Milliseconds since `since` on the animation clock -- so a clock that runs
+// slow makes every duration comparison downstream stretch, with no other
+// changes. Scale 0 returns SNAP_MS so every duration comparison is already done.
+float         animElapsedMs(const Time::steady_tp& since);
+float         getDragMiniScale();
+int           getDragMiniMs();
+int           getDragRecentreMs();
+float         getTouchpadScrollFactor();
+EScrollAction getVerticalScrollAction(ELayout layout);
+EScrollAction getHorizontalScrollAction(ELayout layout);
+int           getWallpaperMode();
+EBackdrop     getBackdrop();
+std::string   getTerminal();
+std::string   getSearchTerminal(); // plugin:hyprdrive:search:terminal (where AI agent rows open)
+bool          getMissionControl();
+int           getMissionControlGap();
+int           getMissionControlReflowMs();
+ETileOrder    getOverviewTileOrder();
+bool          getStrip();
+int           getStripHeight();
+int           getStripMaxScreenPct();
+bool          getSearchDictionary();
+bool          getSearchBrowseOnClick();
+bool          getSearchTranslate();
+std::string   getSearchTranslateEndpoint();
+std::string   getSearchTranslateTarget();
+int           getStripGap();
+bool          getTapSuper();
+// DesktopSwitch.hpp: Super+scroll and the per-cause desktop animations.
+bool          getScrollDesktops();
+std::string   getScrollDesktopsMods();
+bool          getAnimateDesktopKeyboard();
+bool          getAnimateDesktopFocus();
+// The hyprdrive dispatcher a Lua bind calls, from its registry ref (a
+// keybind's `arg` when its handler is `__lua`): {name, argument}, or nothing
+// for a bind that is not one of ours. forgetBindActions() at preReload.
+std::optional<std::pair<std::string, std::string>> boundAction(const std::string& luaRef);
+void                                               forgetBindActions();
+int           getTapSuperTimeoutMs();
+::Config::CCssGapData getCssGapData(const std::string& name);
+int          getShadowEnabled();
+int          getShadowRange();
+int          getShadowRenderPower();
+const ::Config::CGradientValueData* getShadowColor();
+
+}

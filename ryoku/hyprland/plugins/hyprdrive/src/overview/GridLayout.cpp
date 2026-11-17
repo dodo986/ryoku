@@ -1,0 +1,919 @@
+#include "GridLayout.hpp"
+#include "GridSolve.hpp"
+#include "OverviewGeometry.hpp"
+#include "OverviewInternal.hpp"
+
+#include "DebugPaths.hpp"
+
+#include <hyprland/src/desktop/history/WindowHistoryTracker.hpp>
+
+#include <algorithm>
+#include <cstdio>
+#include <format>
+#include <ranges>
+
+// Every body here came out of OverviewInternal.hpp unchanged except for the two
+// mechanical substitutions the move forced: the four globals are now members of
+// the one SGridAnimator, and the pure arithmetic (lerp, open-progress ramp,
+// half-pixel comparison) forwards to OverviewGeometry. Nothing else moved, so a
+// tile that lands somewhere new is a transcription slip and not a redesign.
+
+namespace OvInternal {
+
+    namespace {
+        // The two reads overviewGridPromotable used to make per window.
+        struct SPromoteCtx {
+            bool         enabled = false; // B2 is live: a query is typed AND mission control is on
+            PHLWORKSPACE active;
+        };
+    }
+
+    SGridAnimator& grid() {
+        static SGridAnimator ANIMATOR;
+        return ANIMATOR;
+    }
+
+    const SGridAnimator& gridView() {
+        return grid();
+    }
+
+    namespace {
+        const SGridOwnerScope* g_ownerTop = nullptr;
+
+        // THE TRACE: `touch $XDG_RUNTIME_DIR/hyprdrive-mosaic.on` (the switch
+        // the Mosaic trace already uses, read once a second here) and every
+        // retarget and every size the grid hears about goes to
+        // hyprdrive-mosaic.log as a `grid` line -- so a reporter's log shows
+        // what moved a tile and why, if a tile ever moves at rest again.
+        bool gridTraceOn() {
+            static Time::steady_tp checked{};
+            static bool            on    = false;
+            static bool            ever  = false;
+            const auto             NOW   = Time::steadyNow();
+            if (!ever || NOW - checked > std::chrono::seconds(1)) {
+                ever    = true;
+                checked = NOW;
+                on      = Hyprdrive::DebugPaths::flagOn("hyprdrive-mosaic.on");
+            }
+            return on;
+        }
+
+        void gridTrace(const std::string& line) {
+            if (FILE* const F = Hyprdrive::DebugPaths::openLog("hyprdrive-mosaic.log")) {
+                std::fprintf(F, "%lld grid %s\n", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+                             line.c_str());
+                std::fclose(F);
+            }
+        }
+
+        std::string traceBox(const CBox& b) {
+            return std::format("{:.1f},{:.1f} {:.1f}x{:.1f}", b.x, b.y, b.w, b.h);
+        }
+    }
+
+    SGridOwnerScope::SGridOwnerScope(const PHLMONITOR& monitor) : m_monitor(monitor ? monitor->m_id : MONITOR_INVALID), m_prev(g_ownerTop) {
+        g_ownerTop = this;
+    }
+
+    SGridOwnerScope::~SGridOwnerScope() {
+        g_ownerTop = m_prev;
+    }
+
+    const SGridOwnerScope* SGridOwnerScope::current(const PHLMONITOR& monitor) {
+        if (!monitor)
+            return nullptr;
+        for (auto* scope = g_ownerTop; scope; scope = scope->m_prev)
+            if (scope->m_monitor == monitor->m_id)
+                return scope;
+        return nullptr;
+    }
+
+    void gridSetReflowActive(const PHLMONITOR& monitor) {
+        if (monitor)
+            grid().reflowActive.insert(monitor->m_id);
+    }
+
+    bool gridTakeReflowActive(const PHLMONITOR& monitor) {
+        if (!monitor)
+            return false;
+
+        return grid().reflowActive.erase(monitor->m_id) > 0;
+    }
+
+    // Y9 taught overviewGridWindows and addOverviewWindow that a stashed window
+    // belongs to the desktop it was minimized FROM. Two decisions kept reading
+    // the raw m_workspace instead, and a stashed window's m_workspace is the
+    // stash -- so it could never equal the active workspace, and a window
+    // minimized FROM the active desktop answered "I live somewhere else". It
+    // then took a grid slot twice: once as a home member, once as an
+    // off-desktop match joining the active grid under B2. Measured with the
+    // render-list shadow: 4145 RENDER-GRIDDUP lines in one soak, every one of
+    // them a stashed window against its own home card. The visible cost is the
+    // layout solving for N+1 -- two windows laid out as three, so the tiles sit
+    // in row 0 of a two-row grid with an empty row underneath, which is the
+    // user's "not centered or organized properly".
+    WORKSPACEID overviewGridHomeWorkspace(const PHLWINDOW& window) {
+        if (!window)
+            return WORKSPACE_INVALID;
+
+        if (const auto HOME = Hyprdrive::Minimize::originalWorkspace(window); HOME != WORKSPACE_INVALID)
+            return HOME;
+
+        return window->m_workspace ? Hyprdrive::Compat::id(window->m_workspace) : WORKSPACE_INVALID;
+    }
+
+    namespace {
+        // One window's entry in the session's order snapshot.
+        struct SOrderEntry {
+            PHLWINDOWREF            window;
+            uint64_t                rank = 0; // its place in the focus history, 0 the most recent
+            std::optional<Vector2D> centre;   // its centre on its desktop, if it had one
+        };
+
+        struct SOrderSnapshot {
+            std::unordered_map<const Desktop::View::CWindow*, SOrderEntry> entries;
+            Hyprdrive::Config::ETileOrder mode = Hyprdrive::Config::OVERVIEW_TILE_ORDER_DEFAULT;
+            // Bumped by every take and every change of the mode: a key of the
+            // layout memo, so a solve from the previous session's snapshot or
+            // the previous mode is never reused.
+            uint64_t generation = 1;
+            // POSITION: each desktop's order as it was dealt the first time
+            // its grid was laid out this session (GridSolve.hpp
+            // positionOrder), window -> its place. Kept for the session, so a
+            // window opened meanwhile is appended instead of re-dealing rows.
+            std::unordered_map<WORKSPACEID, std::unordered_map<const Desktop::View::CWindow*, std::pair<PHLWINDOWREF, size_t>>> dealt;
+        };
+
+        SOrderSnapshot& orderSnapshot() {
+            static SOrderSnapshot SNAPSHOT;
+            return SNAPSHOT;
+        }
+
+        const SOrderEntry* orderEntry(const PHLWINDOW& window) {
+            const auto& ENTRIES = orderSnapshot().entries;
+            const auto  IT      = ENTRIES.find(window.get());
+            return IT != ENTRIES.end() && IT->second.window.lock() == window ? &IT->second : nullptr;
+        }
+
+        // Where the window sits on its desktop: the box its layout gave it
+        // (the goal, never the live value), or for a minimized one the box it
+        // was minimized from.
+        std::optional<Vector2D> desktopCentre(const PHLWINDOW& window) {
+            CBox box;
+            if (Hyprdrive::Minimize::originalWorkspace(window) != WORKSPACE_INVALID)
+                box = Hyprdrive::Minimize::originalBox(window);
+            else
+                box = window->geometricBox(Desktop::View::IGeometric::GEOMETRIC_GOAL);
+            if (box.w <= 0 || box.h <= 0)
+                return std::nullopt;
+            return box.middle();
+        }
+
+        // The walk's sort key. Created and position both walk in creation
+        // order (position is dealt onto it by overviewGridLayout: positionDeal);
+        // recent walks last used first.
+        std::tuple<bool, uint64_t, uint64_t> orderKey(const PHLWINDOW& window) {
+            if (orderSnapshot().mode != Hyprdrive::Config::ETileOrder::RECENT)
+                return {false, 0, window->metadata().stableID()};
+            const auto* ENTRY = orderEntry(window);
+            return Hyprdrive::GridSolve::recentKey(ENTRY != nullptr, ENTRY ? ENTRY->rank : 0, window->metadata().stableID());
+        }
+    }
+
+    void gridOrderTake() {
+        auto& SNAP = orderSnapshot();
+        SNAP.entries.clear();
+        SNAP.dealt.clear();
+        ++SNAP.generation;
+        // The mode too, once per open: a value set with `hyprctl eval
+        // hl.config(...)` announces no reload, and is in effect from the next
+        // open (gridTileOrderReload has it at once on a reload).
+        SNAP.mode = Hyprdrive::Config::getOverviewTileOrder();
+
+        // Hyprland's focus history, oldest first (a window enters it at the
+        // FRONT when it opens and moves to the back each time it is focused).
+        const auto& HISTORY = Desktop::History::windowTracker()->fullHistory();
+        const auto  N       = sc<uint64_t>(HISTORY.size());
+        for (uint64_t i = 0; i < N; ++i) {
+            const auto WINDOW = HISTORY[i].lock();
+            if (!WINDOW)
+                continue;
+            SNAP.entries[WINDOW.get()] = SOrderEntry{WINDOW, N - 1 - i, desktopCentre(WINDOW)};
+        }
+        // A window the history does not hold: after every one it does, in
+        // the order they were made (the key's tie).
+        for (const auto& WINDOW : Desktop::windowState()->windows()) {
+            if (!WINDOW || SNAP.entries.contains(WINDOW.get()))
+                continue;
+            SNAP.entries[WINDOW.get()] = SOrderEntry{WINDOW, N, desktopCentre(WINDOW)};
+        }
+    }
+
+    void gridTileOrderReload() {
+        auto&      SNAP = orderSnapshot();
+        const auto MODE = Hyprdrive::Config::getOverviewTileOrder();
+        if (MODE == SNAP.mode)
+            return;
+        SNAP.mode = MODE;
+        SNAP.dealt.clear();
+        ++SNAP.generation;
+    }
+
+    // The home-workspace membership rule, into a buffer the caller owns so the
+    // per-frame layout memo can rebuild its key without allocating.
+    static void overviewGridWindowsInto(const PHLWORKSPACE& workspace, std::vector<PHLWINDOW>& out) {
+        out.clear();
+        if (!workspace)
+            return;
+
+        for (const auto& window : Desktop::windowState()->windows()) {
+            if (getOverviewWindowToShow(window) != window || !shouldShowOverviewWindow(window))
+                continue;
+
+            // Y9 (user): "when an app window is minimized it should still be
+            // visible there, so I can see it and filter to it". A minimized window
+            // is parked on the `special:minimized` stash, so its own m_workspace can
+            // never equal a real one and the plain test below dropped it from every
+            // grid. It belongs to the desktop it was minimized FROM, which is
+            // exactly what Minimize records -- and the only source for it, since the
+            // stash has overwritten the window's own answer.
+            //
+            // This also subsumes X58(a), which asked only that the SEARCH reach
+            // minimized windows: they are in the grid now whether a query is typed
+            // or not, and the query filters them like anything else.
+            if (const auto HOME = Hyprdrive::Minimize::originalWorkspace(window); HOME != WORKSPACE_INVALID) {
+                if (HOME != Hyprdrive::Compat::id(workspace))
+                    continue;
+            } else if (window->m_workspace != workspace)
+                continue;
+
+            out.emplace_back(window);
+        }
+
+        // In the session's order (gridOrderTake, GridSolve.hpp order()), never
+        // Hyprland's list: that is reordered by every click and raise, and the
+        // grid followed it, so a tile could change slots under a hover.
+        Hyprdrive::GridSolve::order(out, 0, out.size(), orderKey);
+    }
+
+    std::vector<PHLWINDOW> overviewGridWindows(const PHLWORKSPACE& workspace) {
+        std::vector<PHLWINDOW> windows;
+        overviewGridWindowsInto(workspace, windows);
+        return windows;
+    }
+
+    // OVERVIEW_CPP_SPEC section 5 B2. With a query typed, matches from every
+    // workspace join the ACTIVE workspace's grid. A promoted window keeps living
+    // in its own workspace's window list and is still drawn in that workspace's
+    // pass; what changes is that its box comes from the active grid and is placed
+    // at the active card's offset. Done here rather than by shuffling windows
+    // between the per-workspace loops so the B1 invariant holds: render, hit-test
+    // and drag all still read the same getOverviewWindowBox and cannot disagree.
+    // The two answers that are the SAME for every window in one query -- is B2
+    // live at all, and which workspace is the active one -- read once and
+    // carried. overviewMainGridWindows asked them per window, so a
+    // getMissionControl() config lookup (a string-keyed map probe, with the key
+    // built fresh each time) ran W times per grid query and the grid is queried
+    // 4-6 times per tile per frame.
+    static SPromoteCtx overviewGridPromoteCtx(PHLMONITOR monitor) {
+        SPromoteCtx ctx;
+        if (!monitor)
+            return ctx;
+
+        ctx.active  = monitor->m_activeWorkspace;
+        ctx.enabled = !g_search.query.text.empty() && overviewMissionControlOn() && !!ctx.active;
+        return ctx;
+    }
+
+    // Identical to the published predicate below, minus the two hoisted reads.
+    static bool overviewGridPromotableIn(const SPromoteCtx& ctx, const PHLWINDOW& window, PHLMONITOR monitor) {
+        if (!ctx.enabled || !window || !monitor)
+            return false;
+
+        if (window->m_monitor != monitor)
+            return false;
+
+        const auto HOME = overviewGridHomeWorkspace(window);
+        return HOME != WORKSPACE_INVALID && HOME != Hyprdrive::Compat::id(ctx.active) && shouldShowOverviewWindow(window);
+    }
+
+    bool overviewGridPromotable(const PHLWINDOW& window, PHLMONITOR monitor) {
+        return overviewGridPromotableIn(overviewGridPromoteCtx(monitor), window, monitor);
+    }
+
+    int gridReleaseMs() {
+        return sc<int>(sc<float>(overviewMissionControlReflowMs()) * GRID_RELEASE_SPEEDUP);
+    }
+
+    // OVERVIEW_CPP_SPEC 13.2 F3-b, the symmetric half: "released back OUT to its
+    // own desktop as the query stops matching". The instant a promoted window
+    // stops matching it leaves the grid, so gridReflowBox is never called for it
+    // and it cuts -- the exact mirror of the pull-in defect. Keep it promoted for
+    // one release after the match dies so it still has somewhere to travel FROM.
+    //
+    // Arming and starting that clock is the owning frame's business
+    // (SGridOwnerScope). A query outside it reads the same answer without
+    // writing it: armed-but-not-started counts as releasing from now, and an
+    // expired or stale entry as gone, but nothing is armed, started or erased.
+    static bool overviewGridReleasingPeek(const PHLWINDOW& window, PHLMONITOR monitor) {
+        const int DURATION = gridReleaseMs();
+        if (DURATION <= 0 || !window)
+            return false;
+
+        if (overviewGridPromotable(window, monitor))
+            return false;
+
+        const auto& G  = gridView();
+        const auto  IT = G.releases.find(window.get());
+        if (IT == G.releases.end())
+            return false;
+        if (IT->second.window.lock() != window || !validMapped(window))
+            return false;
+        if (!IT->second.started)
+            return true;
+        return overviewAnimElapsedMs(IT->second.start) <= sc<float>(DURATION) + GRID_RELEASE_GRACE_MS;
+    }
+
+    static bool overviewGridReleasingStep(const SGridOwnerScope&, const PHLWINDOW& window, PHLMONITOR monitor) {
+        const int DURATION = gridReleaseMs();
+        if (DURATION <= 0 || !window)
+            return false;
+
+        const auto NOW = Time::steadyNow();
+        auto&      G   = grid();
+
+        if (overviewGridPromotable(window, monitor)) {
+            if (G.releases.size() > 64)
+                std::erase_if(G.releases, [](const auto& entry) { return !entry.second.window.lock(); });
+
+            G.releases[window.get()] = SGridRelease{window, {}, false}; // armed, not running
+            return false;
+        }
+
+        const auto IT = G.releases.find(window.get());
+        if (IT == G.releases.end())
+            return false;
+
+        // A recycled address must not inherit a dead window's release, and a window
+        // that unmapped mid-flight must stop being drawn -- the render gate below
+        // trusts this function to have checked.
+        if (IT->second.window.lock() != window || !validMapped(window)) {
+            G.releases.erase(IT);
+            return false;
+        }
+
+        if (!IT->second.started) {
+            IT->second.started = true;
+            IT->second.start   = NOW; // the match died on THIS frame, whenever it is
+        }
+
+        if (overviewAnimElapsedMs(IT->second.start) > sc<float>(DURATION) + GRID_RELEASE_GRACE_MS) {
+            G.releases.erase(IT);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool overviewGridReleasing(const PHLWINDOW& window, PHLMONITOR monitor) {
+        if (const auto* OWNER = SGridOwnerScope::current(monitor))
+            return overviewGridReleasingStep(*OWNER, window, monitor);
+        return overviewGridReleasingPeek(window, monitor);
+    }
+
+    bool overviewGridPromoted(const PHLWINDOW& window, PHLMONITOR monitor) {
+        return overviewGridPromotable(window, monitor) || overviewGridReleasing(window, monitor);
+    }
+
+    // Membership of the MAIN grid. Identical to overviewGridWindows for an empty
+    // query. The strip deliberately keeps the workspace-scoped list: its minis and
+    // its "no matches" count both need the per-cell answer.
+    // The membership walk, into a buffer the caller owns, so the per-frame memo
+    // below can rebuild its key without allocating. `out` is cleared, never
+    // shrunk: the same two buffers are reused every call.
+    static void overviewMainGridWindowsInto(const PHLWORKSPACE& workspace, PHLMONITOR monitor, std::vector<PHLWINDOW>& out) {
+        overviewGridWindowsInto(workspace, out);
+
+        const auto CTX = overviewGridPromoteCtx(monitor);
+        if (!CTX.enabled)
+            return;
+
+        const size_t OWN = out.size();
+        for (const auto& window : Desktop::windowState()->windows()) {
+            // Promotable, not promoted: a RELEASING tile must leave the grid
+            // immediately so the survivors close up WHILE it travels (F3-b-iii,
+            // outbound). It keeps being drawn -- it just no longer owns a slot.
+            if (getOverviewWindowToShow(window) == window && overviewGridPromotableIn(CTX, window, monitor))
+                out.emplace_back(window);
+        }
+        // The promoted ones after the desktop's own, as before, in the same
+        // order among themselves (position: creation order -- they are not on
+        // this desktop, so they have no place on it to match).
+        Hyprdrive::GridSolve::order(out, OWN, out.size(), orderKey);
+    }
+
+    std::vector<PHLWINDOW> overviewMainGridWindows(const PHLWORKSPACE& workspace, PHLMONITOR monitor) {
+        std::vector<PHLWINDOW> windows;
+        overviewMainGridWindowsInto(workspace, monitor, windows);
+        return windows;
+    }
+
+    // WHAT SIZE THE GRID LAYS A WINDOW OUT WITH. It used to be the size
+    // animation's CURRENT value, read afresh by every query -- so a window
+    // mid-configure, or resizing itself for a moment, handed the solver a
+    // different size each time it was asked, and the solver moved its slot
+    // (and its row's) accordingly. Now it is what the owning frame decided
+    // for it (gridObserveSizes, GridReflowModel.hpp SSizeTrack): a change of
+    // the animation's GOAL is taken only once it moved past rounding noise and
+    // stayed moved, and from then on the grid follows the animated value to
+    // the animation's end, exactly as before. A window the frame has not
+    // looked at yet (opened since) answers with its current value, as before.
+    Vector2D overviewGridWindowSize(const PHLWINDOW& window) {
+        const auto& SIZES = gridView().sizes;
+        if (const auto IT = SIZES.find(window.get()); IT != SIZES.end() && IT->second.window.lock() == window)
+            return IT->second.track.input;
+        // Not observed yet (it mapped after this frame's look, or lives on
+        // another monitor and was promoted here): the size its layout gave it.
+        // Never the live value -- the tile pass moves a window's current size
+        // onto its tile while it draws it (GridSolve.hpp).
+        return window->size(Desktop::View::IGeometric::GEOMETRIC_GOAL);
+    }
+
+    // How long a follow may last: 1.5x the window's own size animation
+    // (Hyprland's `windows`/`windowsMove` speed, in deciseconds, as its
+    // animation manager reads it), GridReflow::FOLLOW_CAP_FALLBACK_MS when
+    // there is none to read. Real time, as the follow is.
+    static double gridFollowCapMs(const PHLWINDOW& window) {
+        if (!window->m_realSize)
+            return Hyprdrive::GridReflow::FOLLOW_CAP_FALLBACK_MS;
+        const auto CFG  = window->m_realSize->getConfig().lock();
+        const auto VALS = CFG && CFG->pValues ? CFG->pValues.lock() : CFG;
+        if (!VALS || VALS->internalSpeed <= 0.01F)
+            return Hyprdrive::GridReflow::FOLLOW_CAP_FALLBACK_MS;
+        return 1.5 * VALS->internalSpeed * 100.0;
+    }
+
+    void gridObserveSizes(const SGridOwnerScope& owner, const PHLMONITOR& monitor, const PHLWINDOW& resizing) {
+        if (!monitor || owner.monitor() != monitor->m_id)
+            return;
+
+        auto& G = grid();
+        if (G.sizes.size() > 128)
+            std::erase_if(G.sizes, [](const auto& entry) { return !entry.second.window.lock(); });
+
+        // The frame about to be drawn: render() counts it after this runs.
+        const uint64_t FRAME   = overviewFrameOn(monitor) + 1;
+        const auto     NOW     = Time::steadyNow();
+        const auto     REAL    = [](const Time::steady_tp& since) { return Hyprdrive::Motion::Clock::realMs(since); };
+        bool           waiting = false;
+
+        for (const auto& window : Desktop::windowState()->windows()) {
+            if (!window || !window->mapped() || window->m_monitor != monitor)
+                continue;
+
+            auto&      entry = G.sizes[window.get()];
+            const bool KNOWN = entry.window.lock() == window && entry.monitor == monitor->m_id;
+            const auto OLD   = entry.track.adopted;
+            const auto GOAL  = window->size(Desktop::View::IGeometric::GEOMETRIC_GOAL);
+            entry.window     = window;
+            entry.monitor    = monitor->m_id;
+
+            using Hyprdrive::GridReflow::EFollowEnd;
+            using Hyprdrive::GridReflow::ESize;
+            const auto VALUE     = window->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+            const bool FOLLOWED  = entry.track.following;
+            const bool LATCHED   = entry.track.latched;
+            const auto FOLLOWT0  = entry.track.followSince;
+            const auto FOLLOWCAP = gridFollowCapMs(window);
+            const auto RESULT    = Hyprdrive::GridReflow::observe(entry.track, KNOWN, GOAL, VALUE, FRAME, NOW, REAL, FOLLOWCAP, window == resizing);
+            if (RESULT == ESize::PENDING || entry.track.following)
+                waiting = true;
+
+            if (gridTraceOn()) {
+                if (RESULT != ESize::STEADY && RESULT != ESize::FIRST && RESULT != ESize::FOLLOWING) {
+                    const char* WHAT = RESULT == ESize::PENDING ? "pending" : RESULT == ESize::ADOPTED ? "adopted" : "rejected";
+                    gridTrace(std::format("size {} {} {:.1f}x{:.1f} goal {:.1f}x{:.1f} (since {:.0f} ms) frame {} mon {}", WHAT, window->metadata().appID(), OLD.x, OLD.y, GOAL.x,
+                                          GOAL.y, REAL(entry.track.since), FRAME, monitor->m_name));
+                }
+                if (FOLLOWED && (!entry.track.following || RESULT == ESize::ADOPTED)) {
+                    const auto  WHY  = entry.track.following ? EFollowEnd::DIVERTED : entry.track.followEnd;
+                    const char* WHAT = WHY == EFollowEnd::LANDED ? "landed" : WHY == EFollowEnd::CAPPED ? "capped" : "diverted";
+                    gridTrace(std::format("size follow-end {} {} holds {:.1f}x{:.1f} after {:.0f} ms (cap {:.0f}) frame {} mon {}", WHAT, window->metadata().appID(), OLD.x, OLD.y,
+                                          REAL(FOLLOWT0), FOLLOWCAP, FRAME, monitor->m_name));
+                }
+                if (entry.track.following && (!FOLLOWED || RESULT == ESize::ADOPTED))
+                    gridTrace(std::format("size follow-start {} toward {:.1f}x{:.1f} value {:.1f}x{:.1f} cap {:.0f} ms frame {} mon {}", window->metadata().appID(), GOAL.x, GOAL.y, VALUE.x,
+                                          VALUE.y, FOLLOWCAP, FRAME, monitor->m_name));
+                if (KNOWN && LATCHED != entry.track.latched)
+                    gridTrace(std::format("size {} {} {:.1f}x{:.1f} frame {} mon {}", entry.track.latched ? "latch-on" : "latch-off", window->metadata().appID(), entry.track.adopted.x,
+                                          entry.track.adopted.y, FRAME, monitor->m_name));
+            }
+        }
+
+        // A size the grid has not taken yet needs a later frame to be taken
+        // (or dropped) on, and one it follows needs a frame per animation
+        // tick -- a static overview draws nothing on its own.
+        if (waiting)
+            gridSetReflowActive(monitor);
+    }
+
+    void gridForgetSizes(MONITORID monitor) {
+        std::erase_if(grid().sizes, [monitor](const auto& entry) { return entry.second.monitor == monitor; });
+    }
+
+    // THE SOLVER (GridSolve.hpp solve), and it is now solved ONCE for the whole grid instead of once
+    // per tile. Everything below the membership walk -- the row-count search,
+    // the per-row heights, the centring -- used to run in full for EVERY box
+    // query, and a frame asks for a tile's box 4-6 times per tile per monitor
+    // (render, the blur gate, the frame pacer, the damage gate, the surface
+    // gate) plus once per pointer motion and once per client commit. At n tiles
+    // that is O(n * (W + n^2)) per frame per output for an answer that cannot
+    // change inside a frame.
+    //
+    // The arithmetic is TRANSCRIBED, not rewritten: the same accumulations in
+    // the same order, so every slot lands on the same float it did before. What
+    // changed is that the row walk now assigns every cell as it goes instead of
+    // stopping at the target.
+    namespace {
+        // THE MEMO, and every field of it is a KEY: the slot vector is only
+        // reused when nothing the solver reads has moved. There is no
+        // generation number to forget to bump, and the frame counter keys ONE
+        // thing only: inside the frame that draws, the sizes (GridSolve.hpp
+        // frameSolveHolds) -- a window's size read mid-draw can be its tile's.
+        // Everything else stays keyed by value: renderSearch publishes the
+        // top-chrome height MID-frame, so two calls in one frame legitimately
+        // disagree about `usable`; and a hit test between frames must see the
+        // layout that is actually on screen, which is the one whose inputs are
+        // unchanged.
+        //
+        // The key is rebuilt on every call -- that is the O(W) membership walk,
+        // which no longer carries a config lookup per window -- and what it
+        // buys is the O(n^2) row search, the n geometricBox reads the row walk
+        // repeated, and the whole solve.
+        struct SGridMemo {
+            // --- key
+            WORKSPACEID                          ws             = WORKSPACE_INVALID;
+            MONITORID                            mon            = MONITOR_INVALID;
+            std::string                          query;
+            // The same argument Membership's own cache makes for keying on the
+            // generation: `members` holds raw addresses, and an address can be
+            // reused by a later window. Every open, close, kill and destroy
+            // bumps this, so a recycled address is always looked up in a
+            // generation the stale entry does not carry.
+            uint64_t                             membersGen    = 0;
+            Desktop::View::CWindow*              excluded       = nullptr;
+            bool                                 keepExcluded   = false;
+            float                                gap            = 0.F;
+            CBox                                 usable;
+            std::vector<Desktop::View::CWindow*> members;
+            std::vector<Vector2D>                sizes;
+            // The tile order's snapshot and mode (gridOrderTake).
+            uint64_t                             orderGen       = 0;
+            // --- value
+            std::vector<CBox> slots;
+            bool              valid = false;
+            // The drawn frame it was solved in (0: solved outside one) --
+            // GridSolve.hpp frameSolveHolds.
+            uint64_t          frame = 0;
+        };
+
+        bool sameBox(const CBox& a, const CBox& b) {
+            return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h;
+        }
+
+        // Two outputs, each with the ordinary layout and the drag's own
+        // one-window-more variant, is four live entries; the cap is double that
+        // so a workspace switch cannot thrash it. Linear over a handful of
+        // entries beats hashing a key this wide.
+        constexpr size_t GRID_MEMO_MAX = 8;
+
+        std::vector<SGridMemo>& gridMemos() {
+            static std::vector<SGridMemo> MEMOS;
+            return MEMOS;
+        }
+    }
+
+    // THE POSITION ORDER, onto the walk's (creation-order) members: the first
+    // time this session a desktop's grid is laid out it is dealt from where
+    // each member sat on it as the overview opened (the snapshot's centres --
+    // never the window's box, which mid-draw is its tile's), and from then on
+    // that order is kept: the dealt windows first, in it, then everyone it
+    // does not know (opened since, or promoted by a search) in the walk's
+    // order. A closed window simply is no member any more.
+    static void positionDeal(const PHLWORKSPACE& workspace, std::vector<PHLWINDOW>& windows, const CBox& usable, float gap) {
+        auto& DEALT = orderSnapshot().dealt;
+        auto  IT    = DEALT.find(Hyprdrive::Compat::id(workspace));
+        if (IT == DEALT.end()) {
+            std::vector<Vector2D>                sizes;
+            std::vector<std::optional<Vector2D>> centres;
+            for (const auto& WINDOW : windows) {
+                const auto* ENTRY = orderEntry(WINDOW);
+                sizes.emplace_back(overviewGridWindowSize(WINDOW));
+                centres.emplace_back(ENTRY && overviewGridHomeWorkspace(WINDOW) == Hyprdrive::Compat::id(workspace) ? ENTRY->centre : std::nullopt);
+            }
+            std::vector<size_t> perm;
+            Hyprdrive::GridSolve::positionOrder(sizes, centres, usable, gap, perm);
+            IT = DEALT.emplace(Hyprdrive::Compat::id(workspace), std::unordered_map<const Desktop::View::CWindow*, std::pair<PHLWINDOWREF, size_t>>{}).first;
+            for (size_t k = 0; k < perm.size(); ++k)
+                if (centres[perm[k]])
+                    IT->second[windows[perm[k]].get()] = {windows[perm[k]], k};
+        }
+
+        const auto& PLACES = IT->second;
+        const auto  PLACE  = [&PLACES](const PHLWINDOW& w) -> std::pair<bool, size_t> {
+            const auto P = PLACES.find(w.get());
+            if (P == PLACES.end() || P->second.first.lock() != w)
+                return {true, 0};
+            return {false, P->second.second};
+        };
+        std::ranges::stable_sort(windows, [&PLACE](const PHLWINDOW& a, const PHLWINDOW& b) { return PLACE(a) < PLACE(b); });
+    }
+
+    bool overviewGridLayout(const PHLWORKSPACE& workspace, PHLMONITOR monitor, const PHLWINDOW& target, CBox& out) {
+        if (!workspace || !monitor || !target)
+            return false;
+
+        // Reused across calls: the membership walk is the one allocation this
+        // function would otherwise make several dozen times a frame. EMPTIED on
+        // the way out, every way out -- it holds owning window handles, and a
+        // buffer that kept the last grid's would keep a closed window alive
+        // until the next time an overview was opened.
+        static std::vector<PHLWINDOW>                WINDOWS;
+        static std::vector<Desktop::View::CWindow*>  MEMBERS;
+        static std::vector<Vector2D>                 SIZES;
+
+        auto dropWindowRefs = Hyprutils::Utils::CScopeGuard([] { WINDOWS.clear(); });
+
+        overviewMainGridWindowsInto(workspace, monitor, WINDOWS);
+
+        // The dragged window keeps a slot for its OWN query: the drag proxy is sized
+        // off it, and a proxy sized from the N-1 layout would jump the frame the
+        // drag begins. It is absent only from everyone else's layout.
+        const auto EXCLUDED     = grid().dragExcluded;
+        const bool KEEPEXCLUDED = EXCLUDED && target.get() == EXCLUDED;
+        if (EXCLUDED && !KEEPEXCLUDED)
+            std::erase_if(WINDOWS, [EXCLUDED](const auto& window) { return window.get() == EXCLUDED; });
+
+        if (Membership::renderShadowEnabled()) {
+            for (size_t i = 0; i < WINDOWS.size(); ++i)
+                for (size_t j = i + 1; j < WINDOWS.size(); ++j)
+                    if (WINDOWS[i] == WINDOWS[j])
+                        Membership::renderDivergence("GRIDDUP", Hyprdrive::Compat::id(workspace), WINDOWS[i]->m_workspace ? Hyprdrive::Compat::id(WINDOWS[i]->m_workspace) : WORKSPACE_INVALID,
+                                                     WINDOWS[i]->metadata().appID(), WINDOWS[i]->metadata().title());
+        }
+
+        if (std::ranges::find(WINDOWS, target) == WINDOWS.end())
+            return false;
+
+        CBox usable = {monitor->m_position, monitor->m_size};
+        if (workspace->space()) {
+            if (const auto WORKAREA = workspace->space()->workArea(); WORKAREA.w > 1 && WORKAREA.h > 1)
+                usable = WORKAREA;
+        }
+
+        // Grid tiles must not slide under the strip band or the search row (X10) --
+        // shrinking `usable` here is what makes the tiles compact to give the space
+        // back.
+        //
+        // X60 SUPERSEDES X48's placement: the results are part of the TOP chrome
+        // now, between the search row and the strip, so the whole stack below them
+        // moves down and the tiles give their space back from the top. X21's reflow
+        // is untouched -- the tiles still shrink and compact off the same eased
+        // band, only the direction changed. X48's real constraint survives in
+        // overviewResultsBandTarget's budget: the band may never grow so tall that
+        // the strip and the tiles are pushed off the screen.
+        //
+        // The strip's reserved band is taller than the drawn panel. Inset by the
+        // panel's foot plus the same gap that sits between the search pill and
+        // the strip, not by the unused bottom of the band plus another
+        // mission-control gap -- that pair was the hole between strip and windows.
+        //
+        // The stack is measured from the MONITOR's top edge -- the pill docks
+        // off overviewTopChromeBottomL and the strip's band off m_position.y --
+        // so it is a floor to clamp against, not a margin to add. Adding it to
+        // a work area that already excluded a top bar counted that bar twice
+        // and pushed every tile down by its height (22px under this rice).
+        if (const float TOPCHROME = overviewStripStackL(monitor) + overviewSearchLogicalHeight(monitor) + overviewResultsLogicalHeight(monitor); TOPCHROME > 0.F) {
+            const double BOTTOM = usable.y + usable.h;
+            usable.y            = std::max(usable.y, monitor->m_position.y + TOPCHROME);
+            usable.h            = BOTTOM - usable.y;
+            if (usable.h <= 1)
+                return false;
+        }
+        const float GAP = sc<float>(overviewMissionControlGap());
+
+        usable.x += GAP;
+        usable.w -= 2.0 * GAP;
+        usable.h -= GAP;
+        if (usable.w <= 1 || usable.h <= 1)
+            return false;
+
+        if (orderSnapshot().mode == Hyprdrive::Config::ETileOrder::POSITION)
+            positionDeal(workspace, WINDOWS, usable, GAP);
+
+        size_t index = WINDOWS.size();
+        for (size_t i = 0; i < WINDOWS.size(); ++i) {
+            if (WINDOWS[i] == target) {
+                index = i;
+                break;
+            }
+        }
+        if (index >= WINDOWS.size())
+            return false;
+
+        MEMBERS.clear();
+        SIZES.clear();
+        MEMBERS.reserve(WINDOWS.size());
+        SIZES.reserve(WINDOWS.size());
+        for (const auto& WINDOW : WINDOWS) {
+            MEMBERS.emplace_back(WINDOW.get());
+            SIZES.emplace_back(overviewGridWindowSize(WINDOW));
+        }
+
+        const uint64_t MEMBERSGEN = Membership::generation();
+        const uint64_t ORDERGEN   = orderSnapshot().generation;
+        const bool     INDRAW     = SGridOwnerScope::current(monitor) != nullptr;
+        const uint64_t FRAME      = overviewFrameOn(monitor);
+
+        auto&      MEMOS = gridMemos();
+        SGridMemo* hit   = nullptr;
+        for (auto& memo : MEMOS) {
+            if (memo.ws != Hyprdrive::Compat::id(workspace) || memo.mon != monitor->m_id || memo.excluded != EXCLUDED || memo.keepExcluded != KEEPEXCLUDED || memo.gap != GAP)
+                continue;
+            if (memo.membersGen != MEMBERSGEN)
+                continue;
+            if (!sameBox(memo.usable, usable) || memo.query != g_search.query.text)
+                continue;
+            if (memo.members != MEMBERS || memo.orderGen != ORDERGEN)
+                continue;
+            // ONE SOLVE PER DRAWN FRAME (GridSolve.hpp): a size that reads
+            // differently later in the frame that solved it does not re-solve.
+            if (memo.sizes != SIZES && !Hyprdrive::GridSolve::frameSolveHolds(INDRAW, memo.frame, FRAME, true))
+                continue;
+
+            hit = &memo;
+            break;
+        }
+
+        if (!hit) {
+            if (MEMOS.size() >= GRID_MEMO_MAX)
+                MEMOS.erase(MEMOS.begin());
+
+            MEMOS.emplace_back();
+            hit               = &MEMOS.back();
+            hit->ws           = Hyprdrive::Compat::id(workspace);
+            hit->mon          = monitor->m_id;
+            hit->query        = g_search.query.text;
+            hit->membersGen   = MEMBERSGEN;
+            hit->excluded     = EXCLUDED;
+            hit->keepExcluded = KEEPEXCLUDED;
+            hit->gap          = GAP;
+            hit->usable       = usable;
+            hit->members      = MEMBERS;
+            hit->sizes        = SIZES;
+            hit->frame        = INDRAW ? FRAME : 0;
+            hit->orderGen     = ORDERGEN;
+
+            Hyprdrive::GridSolve::solve(SIZES, usable, GAP, hit->slots);
+            hit->valid = !hit->slots.empty();
+        }
+
+        if (!hit->valid || index >= hit->slots.size())
+            return false;
+
+        out = hit->slots[index];
+        // The strip label's slide (gridShiftL): every slot, after the solve, so
+        // the grid keeps its size and just moves.
+        out.y += g_search.layoutOn(monitor->m_id).gridShiftL;
+        return true;
+    }
+
+    bool overviewGridSlot(const PHLWINDOW& window, PHLMONITOR monitor, CBox& out, bool* promotedOut) {
+        if (promotedOut)
+            *promotedOut = false;
+
+        if (!overviewMissionControlOn() || !monitor)
+            return false;
+
+        const auto ACTIVE = monitor->m_activeWorkspace;
+        if (!ACTIVE)
+            return false;
+
+        // A promoted window is laid out in the ACTIVE workspace's grid, not its own.
+        // HOME, not m_workspace: a window stashed FROM the active desktop owns a slot
+        // in the active grid outright, and asking its m_workspace sent it down the
+        // promoted branch instead -- the other half of the duplicate above.
+        //
+        // The promoted answer is HANDED BACK rather than asked for a second time
+        // by the caller: overviewGridPromoted arms the release map, and
+        // getOverviewWindowBox was asking it twice per box for a value that
+        // cannot differ between the two calls.
+        if (overviewGridHomeWorkspace(window) != Hyprdrive::Compat::id(ACTIVE)) {
+            if (!overviewGridPromoted(window, monitor))
+                return false;
+
+            if (promotedOut)
+                *promotedOut = true;
+        }
+
+        return overviewGridLayout(ACTIVE, monitor, window, out);
+    }
+
+    float overviewGridProgress(float scale) {
+        return Hyprdrive::Geometry::gridProgress(scale, overviewOpenScale());
+    }
+
+    // WHY THE RELEASE NEEDS ITS OWN CURVE, and it is not a taste question.
+    //
+    // A reflow ENDS somewhere the user is looking at -- a slot in the grid -- so
+    // the house decel curve is right: it spends its speed early and settles in
+    // view. The release ENDS OFF THE MONITOR, at the window's real rect on a
+    // desktop that is two cards away, and the same decel curve then spends that
+    // speed getting there. Measured on 9c2742f at anim_scale 20 with the
+    // render-list trace (evidence: zrig/f3b/round1/): the tile is drawn every
+    // frame, correctly interpolated, and crosses the monitor edge at animated
+    // elapsed 24.4ms of a 300ms curve -- 8.1% of the animation, 42% of the
+    // travel, and ONE AND A HALF FRAMES at 60Hz once the slowdown is taken off.
+    // That is exactly the "'Fast' is not a licence to drop to one or two frames"
+    // that F3-b-ii forbids, and it is why the outbound reads as a cut.
+    //
+    // The house ACCEL curve (0.7,0 0.84,0) leaves slowly and then goes: the same
+    // 42% of travel now takes 87.4% of the duration, so the visible half of the
+    // journey gets the whole animation instead of its first twelfth. Same curve
+    // the overview's own close uses, and the same direction the Apple rule asks
+    // an exit to run in.
+    float gridReflowEase(float t, bool exiting) {
+        return houseEase(!exiting, t);
+    }
+
+    bool gridBoxesDiffer(const CBox& a, const CBox& b) {
+        return Hyprdrive::Geometry::boxesDiffer(a, b);
+    }
+
+    namespace {
+        Hyprdrive::GridReflow::SAsk gridAsk(const PHLMONITOR& monitor, const CBox& slot, const CBox* enterFrom, bool promoted, bool exiting, int duration) {
+            return Hyprdrive::GridReflow::SAsk{slot, enterFrom, promoted, exiting, overviewFrameOn(monitor), sc<float>(duration)};
+        }
+
+        const auto ANIM_ELAPSED = [](const Time::steady_tp& since) { return overviewAnimElapsedMs(since); };
+        const auto REFLOW_EASE  = [](float t, bool exiting) { return gridReflowEase(t, exiting); };
+
+        // THE ONLY WRITER of a reflow ease: the owning frame. Seeding a tile
+        // that was not in the grid last frame (OVERVIEW_CPP_SPEC F3-b-i: a
+        // first appearance, or a search promoting it off another desktop, is
+        // seeded where it really sits so the ease carries it in), advancing it,
+        // and re-aiming it when its slot moved -- GridReflowModel.hpp step(),
+        // which is the old body of this function.
+        CBox gridReflowStep(const SGridOwnerScope&, const PHLMONITOR& monitor, const PHLWINDOW& window, const CBox& slot, const CBox* enterFrom, bool promoted, bool exiting,
+                            int duration) {
+            auto& G = grid();
+            if (G.reflows.size() > 64)
+                std::erase_if(G.reflows, [](const auto& entry) { return !entry.second.window.lock(); });
+
+            auto&      entry = G.reflows[window.get()];
+            const bool KNOWN = entry.window.lock() == window;
+            const auto WAS   = entry.ease.to;
+            const auto ASK   = gridAsk(monitor, slot, enterFrom, promoted, exiting, duration);
+
+            CBox       out;
+            using Hyprdrive::GridReflow::EStep;
+            const auto RESULT = Hyprdrive::GridReflow::step(entry.ease, KNOWN, ASK, Time::steadyNow(), ANIM_ELAPSED, REFLOW_EASE, out);
+            entry.window      = window;
+
+            if (RESULT == EStep::SEEDED ? gridBoxesDiffer(out, slot) : RESULT != EStep::SETTLED)
+                gridSetReflowActive(monitor);
+
+            if (RESULT == EStep::RETARGETED && gridTraceOn())
+                gridTrace(std::format("retarget {} {} -> {} from {} frame {} mon {}", window->metadata().appID(), traceBox(WAS), traceBox(slot), traceBox(out), ASK.frame, monitor->m_name));
+
+            return out;
+        }
+
+        CBox gridReflowPeek(const PHLMONITOR& monitor, const PHLWINDOW& window, const CBox& slot, const CBox* enterFrom, bool promoted, bool exiting, int duration) {
+            const auto& G     = gridView();
+            const auto  IT    = G.reflows.find(window.get());
+            const bool  FOUND = IT != G.reflows.end();
+            const bool  KNOWN = FOUND && IT->second.window.lock() == window;
+            return Hyprdrive::GridReflow::peek(FOUND ? &IT->second.ease : nullptr, KNOWN, gridAsk(monitor, slot, enterFrom, promoted, exiting, duration), ANIM_ELAPSED,
+                                               REFLOW_EASE);
+        }
+    }
+
+    CBox gridReflowBox(const PHLMONITOR& monitor, const PHLWINDOW& window, const CBox& slot, const CBox* enterFrom, bool promoted, bool exiting) {
+        const int DURATION = exiting ? gridReleaseMs() : overviewMissionControlReflowMs();
+        if (DURATION <= 0)
+            return slot;
+
+        if (const auto* OWNER = SGridOwnerScope::current(monitor))
+            return gridReflowStep(*OWNER, monitor, window, slot, enterFrom, promoted, exiting, DURATION);
+        return gridReflowPeek(monitor, window, slot, enterFrom, promoted, exiting, DURATION);
+    }
+
+    void gridReflowSeed(const PHLWINDOW& window, const PHLMONITOR& monitor, const CBox& from, const CBox& to) {
+        if (!window || !monitor)
+            return;
+        grid().reflows[window.get()] = SGridReflow{window, {from, to, Time::steadyNow(), overviewFrameOn(monitor), false}};
+        gridSetReflowActive(monitor);
+    }
+
+} // namespace OvInternal

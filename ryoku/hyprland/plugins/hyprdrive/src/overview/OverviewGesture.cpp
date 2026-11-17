@@ -1,0 +1,1175 @@
+#include "OverviewGesture.hpp"
+
+#include "DesktopStrip.hpp"
+#include "Mosaic.hpp"
+
+#include "Config.hpp"
+#include "DebugPaths.hpp"
+#include "IOverview.hpp"
+#include "Overview.hpp"
+#include "SearchBackend.hpp"
+#include "SearchProviders.hpp"
+#include "Scratchpad.hpp"
+#include "OverviewGestureDecision.hpp"
+#include <format>
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <cstdarg>
+#include <cstdlib>
+#include <optional>
+#include <unordered_map>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
+#include "HyprCompat.hpp"
+#include <hyprland/src/keybinds/Resolver.hpp>
+#include <ranges>
+#include <string_view>
+#include <vector>
+#include <linux/input-event-codes.h>
+#include <xkbcommon/xkbcommon.h>
+#include <hyprland/src/Compositor.hpp>
+#include <hyprland/src/event/EventBus.hpp>
+#include <hyprland/src/helpers/time/Time.hpp>
+#include <hyprland/src/desktop/state/FocusState.hpp>
+#include <hyprland/src/devices/IKeyboard.hpp>
+#include <hyprland/src/keybinds/Manager.hpp>
+#include <hyprland/src/managers/SeatManager.hpp>
+#include <hyprland/src/managers/input/InputManager.hpp>
+#include <hyprland/src/managers/input/UnifiedWorkspaceSwipeGesture.hpp>
+#include <hyprland/src/config/shared/actions/ConfigActions.hpp>
+#include <hyprland/src/output/Monitor.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
+
+COverviewGesture::COverviewGesture(eTrackpadGestureDirection direction) : m_direction(direction) {}
+
+// OverviewGestureDecision's directions are Hyprland's, value for value.
+namespace {
+    using GestureDir = Hyprdrive::OverviewGestureDecision::EDir;
+    static_assert(static_cast<uint8_t>(GestureDir::None) == TRACKPAD_GESTURE_DIR_NONE && static_cast<uint8_t>(GestureDir::Swipe) == TRACKPAD_GESTURE_DIR_SWIPE &&
+                  static_cast<uint8_t>(GestureDir::Left) == TRACKPAD_GESTURE_DIR_LEFT && static_cast<uint8_t>(GestureDir::Right) == TRACKPAD_GESTURE_DIR_RIGHT &&
+                  static_cast<uint8_t>(GestureDir::Up) == TRACKPAD_GESTURE_DIR_UP && static_cast<uint8_t>(GestureDir::Down) == TRACKPAD_GESTURE_DIR_DOWN &&
+                  static_cast<uint8_t>(GestureDir::Vertical) == TRACKPAD_GESTURE_DIR_VERTICAL && static_cast<uint8_t>(GestureDir::Horizontal) == TRACKPAD_GESTURE_DIR_HORIZONTAL &&
+                  static_cast<uint8_t>(GestureDir::Pinch) == TRACKPAD_GESTURE_DIR_PINCH && static_cast<uint8_t>(GestureDir::PinchOut) == TRACKPAD_GESTURE_DIR_PINCH_OUT &&
+                  static_cast<uint8_t>(GestureDir::PinchIn) == TRACKPAD_GESTURE_DIR_PINCH_IN,
+                  "eTrackpadGestureDirection changed: OverviewGestureDecision::EDir must follow it");
+
+    GestureDir gestureDir(eTrackpadGestureDirection direction) {
+        return static_cast<GestureDir>(static_cast<uint8_t>(direction));
+    }
+}
+
+// THE SWIPE OPENS AND CLOSES EVERY MONITOR, like tap-SUPER (user, 2026-09-14:
+// the gesture only opened the monitor under the pointer). Each monitor's
+// overview gets the same delta, so every `scale` holds the same value and each
+// onSwipeEnd reaches the same commit-or-cancel decision: they finish together
+// without having to be told to.
+void COverviewGesture::begin(const ITrackpadGesture::STrackpadGestureBegin& e) {
+    ITrackpadGesture::begin(e);
+
+    m_lastDelta   = 0.F;
+    m_firstUpdate = true;
+    m_overviews.clear();
+
+    const auto FOCUSED = Desktop::focusState()->monitor();
+    if (!FOCUSED)
+        return;
+
+    // A "vertical" binding is both halves of an up/down pair: Hyprland hands
+    // begin the direction the fingers actually took (UP or DOWN), so down is
+    // the close (OverviewGestureDecision.hpp, host-tested).
+    const bool WANT_CLOSE = Hyprdrive::OverviewGestureDecision::wantsClose(gestureDir(m_direction), gestureDir(e.direction));
+
+    // An overview still animating out cannot be swiped (onSwipeUpdate reads
+    // `closing` and would run backwards). Drop them first, on every monitor --
+    // and before ensureScrollOverviewHooks, because dropping the last one tears
+    // the hooks down.
+    for (const auto& MONITOR : State::monitorState()->monitors()) {
+        if (const auto OVERVIEW = scrollOverviewForMonitor(MONITOR); OVERVIEW && OVERVIEW->isClosing())
+            dropScrollOverviewsForMonitor(MONITOR);
+    }
+
+    if (!WANT_CLOSE) {
+        // Already open where the fingers are: swipe-up does not close.
+        if (scrollOverviewForMonitor(FOCUSED))
+            return;
+        if (!ensureScrollOverviewHooks())
+            return;
+
+        // Locked: the swipe opens nothing (hyprdriveSessionLocked).
+        if (hyprdriveSessionLocked())
+            return;
+        // Super-tap and the dock button reset the search session; swipe-open
+        // was the remaining door, so a query survived close and came back.
+        resetSearchSession();
+        // No SearchProviders::warm() here: see X54 in main.cpp. The first
+        // keystroke starts cold providers; an open never launches GTK apps.
+        SearchBackend::init();
+
+        for (const auto& MONITOR : State::monitorState()->monitors()) {
+            if (!MONITOR || !MONITOR->m_enabled || !MONITOR->m_activeWorkspace || scrollOverviewForMonitor(MONITOR))
+                continue;
+
+            const auto OVERVIEW = makeShared<COverview>(MONITOR->m_activeWorkspace, true, MONITOR);
+            registerScrollOverview(OVERVIEW);
+            OVERVIEW->m_swipeClosing = false;
+            OVERVIEW->m_isSwiping    = true;
+            m_overviews.emplace_back(OVERVIEW);
+        }
+        return;
+    }
+
+    // A copy: nothing here should mutate the registry, but close paths do, and
+    // iterating the live vector through one would be a use-after-free.
+    const auto OPEN = scrollOverviews();
+    for (const auto& OVERVIEW : OPEN) {
+        if (!OVERVIEW || OVERVIEW->isClosing())
+            continue;
+
+        // Only the pointer's monitor picks the desktop under it. On the others
+        // the pointer is off-screen, and a side card reaching past the edge
+        // could still be "hovered" and switch that monitor's desktop.
+        if (OVERVIEW->pMonitor.lock() == FOCUSED)
+            OVERVIEW->selectHoveredWorkspace();
+        OVERVIEW->m_swipeClosing = true;
+        OVERVIEW->m_isSwiping    = true;
+        m_overviews.emplace_back(OVERVIEW);
+    }
+}
+
+void COverviewGesture::update(const ITrackpadGesture::STrackpadGestureUpdate& e) {
+    if (m_overviews.empty())
+        return;
+
+    if (m_firstUpdate) {
+        m_firstUpdate = false;
+        return;
+    }
+
+    // Signed follow: reversing the fingers undoes the motion. Clamp to the
+    // gesture length so extra travel does not wind up a reverse.
+    m_lastDelta += distance(e);
+    const float MAX = sc<float>(Hyprdrive::Config::getGestureDistance());
+    m_lastDelta     = std::clamp(m_lastDelta, 0.F, MAX);
+
+    for (const auto& REF : m_overviews) {
+        if (const auto OVERVIEW = REF.lock())
+            OVERVIEW->onSwipeUpdate(m_lastDelta);
+    }
+}
+
+void COverviewGesture::end(const ITrackpadGesture::STrackpadGestureEnd& e) {
+    // Locked up front: onSwipeEnd may close, and closing unregisters.
+    std::vector<SP<IOverview>> driven;
+    for (const auto& REF : m_overviews) {
+        if (const auto OVERVIEW = REF.lock())
+            driven.emplace_back(OVERVIEW);
+    }
+    m_overviews.clear();
+
+    for (const auto& OVERVIEW : driven)
+        OVERVIEW->onSwipeEnd();
+}
+
+void COverviewWorkspaceGesture::setTapeOffset(const PHLWORKSPACE& ws) {
+    Hyprdrive::DesktopTape::setOffset(ws, m_tapeOffset);
+}
+
+// A gesture bound to "swipe" (any direction) is handed its updates as SWIPE,
+// whose distance is the swipe's LENGTH -- never negative, so left and right
+// were the same motion and no desktop switched (user, 2026-11-01: "super+3
+// finger swipe does not switch desktops"; Omarchy's panel binds the Super one
+// that way). The desktops are a row: such a swipe is read across it.
+template <typename T>
+static T acrossDesktops(T e) {
+    if (e.direction == TRACKPAD_GESTURE_DIR_SWIPE)
+        e.direction = TRACKPAD_GESTURE_DIR_HORIZONTAL;
+    return e;
+}
+
+void COverviewWorkspaceGesture::begin(const ITrackpadGesture::STrackpadGestureBegin& eIn) {
+    const auto e = acrossDesktops(eIn);
+    ITrackpadGesture::begin(e);
+    m_inOverview = false;
+    m_overview.reset();
+
+    const auto MONITOR  = Desktop::focusState()->monitor();
+    const auto OVERVIEW = openScrollOverviewForMonitor(MONITOR);
+    if (OVERVIEW) {
+        m_inOverview = true;
+        m_overview   = OVERVIEW;
+        OVERVIEW->onWorkspaceSwipeBegin();
+        return;
+    }
+
+    m_mode = EMode::Native;
+    m_tapeWorkspace.reset();
+    if (!m_allWorkspaces && MONITOR && !MONITOR->m_activeSpecialWorkspace) {
+        if (const auto WS = MONITOR->m_activeWorkspace; WS) {
+            // A Mosaic desktop on its infinite canvas is NOT a tape here: the
+            // swipe switches desktops at once (user, 2026-10-29). Super+move
+            // and Super+scroll still pan the canvas.
+            if (const auto TAPE = Hyprdrive::DesktopTape::probe(WS); TAPE.usable) {
+                m_mode          = EMode::Tape;
+                m_tapeWorkspace = WS;
+                m_tapeOffset    = std::clamp(TAPE.offset, 0.0, TAPE.maxOffset);
+                m_tapeMax       = TAPE.maxOffset;
+                // Focus must not follow the pointer while the windows slide under
+                // it: each new window under the cursor took focus, and the layout
+                // refit its camera to that window -- a jump past the end.
+                if (!m_forcedFollow) {
+                    m_prevFollow   = Hyprdrive::Config::getValue<int>("input:follow_mouse");
+                    m_forcedFollow = true;
+                    Hyprdrive::Config::setValue("input:follow_mouse", 0);
+                }
+                m_tape.begin(e);
+                return;
+            }
+        }
+    }
+
+    if (m_allWorkspaces && !m_forcedUseR) {
+        m_prevUseR   = Hyprdrive::Config::getValue<int>("gestures:workspace_swipe_use_r");
+        m_forcedUseR = true;
+        Hyprdrive::Config::setValue("gestures:workspace_swipe_use_r", 1);
+    }
+
+    // The desktop strip moving the row (a wheel scroll still landing): the
+    // desktop most on screen becomes the shown one, where it is, for the swipe
+    // to begin from (DesktopStrip.hpp).
+    const bool STRIP = MONITOR && Hyprdrive::DesktopStrip::catchForSwipe(MONITOR);
+
+    m_native.begin(e);
+
+    // CAUGHT MID-SLIDE (user, 2026-11-02: reversible "if I change my mind").
+    // A swipe begun while the last one's release is still sliding the desktops
+    // home starts from where they are -- the native swipe begins at 0 and
+    // jumped them there. Its position is set to match the desktop on screen;
+    // the fingers carry on from it, and Hyprland puts the neighbour beside it.
+    if (g_pUnifiedWorkspaceSwipe && g_pUnifiedWorkspaceSwipe->isGestureInProgress() && MONITOR && MONITOR->m_activeWorkspace) {
+        if (STRIP)
+            Hyprdrive::DesktopStrip::letGo(MONITOR);
+        const auto& OFF = MONITOR->m_activeWorkspace->m_renderOffset;
+        if (OFF && (OFF->isBeingAnimated() || STRIP)) {
+            const Vector2D V     = OFF->value();
+            const bool     VERT  = std::abs(V.y) > std::abs(V.x);
+            const double   GAP   = sc<double>(Hyprdrive::Config::getValue<int>("general:gaps_workspaces"));
+            const double   SPAN  = (VERT ? MONITOR->m_size.y : MONITOR->m_size.x) + GAP;
+            const double   SWIPE = std::max(1.0, sc<double>(Hyprdrive::Config::getValue<int>("gestures:workspace_swipe_distance")));
+            // Drawn stretched past a canvas desktop's overhang (Mosaic's swipe
+            // stretch): the swipe's own place is that divided back out, or the
+            // desktop jumped outward by the stretch as it was caught.
+            const double   D     = (VERT ? V.y : V.x) / std::max(1.0, Hyprdrive::Mosaic::swipeStretch(MONITOR->m_activeWorkspace, MONITOR, V));
+            if (std::abs(D) >= 0.5 && SPAN > 1)
+                g_pUnifiedWorkspaceSwipe->update(-D / SPAN * SWIPE);
+        }
+    }
+}
+
+void COverviewWorkspaceGesture::update(const ITrackpadGesture::STrackpadGestureUpdate& eIn) {
+    const auto e = acrossDesktops(eIn);
+    if (m_inOverview) {
+        const auto OVERVIEW = m_overview.lock();
+        if (!OVERVIEW)
+            return;
+        // Negate so the cards stick to the fingers: swipe right, content moves right.
+        OVERVIEW->onWorkspaceSwipeUpdate(-distance(e));
+        return;
+    }
+
+    if (m_mode == EMode::Tape) {
+        m_tape.update(e); // its velocity is what the release snaps with
+        const auto WS = m_tapeWorkspace.lock();
+        if (!WS)
+            return;
+        // Fingers left (distance < 0) move the tape forward, 1:1 in px.
+        const double WANT = m_tapeOffset - distance(e);
+        double       over = 0.0;
+        if (WANT > m_tapeMax)
+            over = WANT - m_tapeMax;
+        else if (WANT < 0.0)
+            over = WANT; // negative: past the start
+        m_tapeOffset = std::clamp(WANT, 0.0, m_tapeMax);
+        setTapeOffset(WS);
+        if (over == 0.0)
+            return;
+        // Pinned at the end it reached; the rest of the travel switches.
+        const bool FAREND = over > 0.0;
+        if (!g_pUnifiedWorkspaceSwipe || g_pUnifiedWorkspaceSwipe->isGestureInProgress())
+            return;
+        g_pUnifiedWorkspaceSwipe->begin();
+        if (!g_pUnifiedWorkspaceSwipe->isGestureInProgress())
+            return; // e.g. a locked session: stay on the tape, pinned
+        // Same sign the native swipe would have accumulated for this motion:
+        // D += invert ? -distance : distance, and the tape moved forward (far
+        // end) exactly when distance was negative.
+        const bool INVERT = Hyprdrive::Config::getValue<int>("gestures:workspace_swipe_invert") != 0;
+        const double MAG  = std::abs(over);
+        m_switchDelta     = (FAREND == INVERT) ? MAG : -MAG;
+        m_switchSide      = m_switchDelta > 0.0 ? 1 : -1;
+        m_tapeAtEnd       = FAREND;
+        m_mode            = EMode::TapeSwitch;
+        g_pUnifiedWorkspaceSwipe->update(m_switchDelta);
+        return;
+    }
+
+    if (m_mode == EMode::TapeSwitch) {
+        const bool   INVERT = Hyprdrive::Config::getValue<int>("gestures:workspace_swipe_invert") != 0;
+        const double DELTA  = distance(e);
+        const double D      = m_switchDelta + (INVERT ? -DELTA : DELTA);
+        if (D * m_switchSide > 0.0) {
+            m_switchDelta = D;
+            g_pUnifiedWorkspaceSwipe->update(D);
+            return;
+        }
+        // Back past where the tape ended: that switch never happened (a delta
+        // under 2 always reverts), and the remainder scrolls the windows again.
+        g_pUnifiedWorkspaceSwipe->update(0.0);
+        g_pUnifiedWorkspaceSwipe->end();
+        m_mode = EMode::Tape;
+        if (const auto WS = m_tapeWorkspace.lock()) {
+            m_tapeOffset = std::clamp(m_tapeAtEnd ? m_tapeMax - std::abs(D) : std::abs(D), 0.0, m_tapeMax);
+            setTapeOffset(WS);
+        }
+        return;
+    }
+
+    m_native.update(e);
+}
+
+void COverviewWorkspaceGesture::end(const ITrackpadGesture::STrackpadGestureEnd& eIn) {
+    const auto e = acrossDesktops(eIn);
+    if (m_inOverview) {
+        if (const auto OVERVIEW = m_overview.lock())
+            OVERVIEW->onWorkspaceSwipeEnd();
+        m_overview.reset();
+        m_inOverview = false;
+        return;
+    }
+
+    // follow_mouse back before anything settles focus.
+    const auto RESTOREFOLLOW = [this] {
+        if (m_forcedFollow) {
+            Hyprdrive::Config::setValue("input:follow_mouse", m_prevFollow);
+            m_forcedFollow = false;
+        }
+    };
+
+    // The release snap (Hyprland's, with momentum) may CENTRE a first or last
+    // column -- a quick flick left half a window and empty space beside it
+    // (user, 2026-09-29: "never see empty space on the scrolling desktop").
+    // Whatever it picked is pulled back inside the tape.
+    const auto SNAPINSIDE = [this, &e] {
+        m_tape.end(e); // snap to a column (with momentum) and focus it
+        if (const auto WS = m_tapeWorkspace.lock()) {
+            Hyprdrive::DesktopTape::setOffset(WS, Hyprdrive::DesktopTape::probe(WS).offset); // setOffset clamps
+        }
+    };
+
+    if (m_mode == EMode::Tape) {
+        RESTOREFOLLOW();
+        SNAPINSIDE();
+        m_mode = EMode::Native;
+        m_tapeWorkspace.reset();
+        return;
+    }
+
+    if (m_mode == EMode::TapeSwitch) {
+        RESTOREFOLLOW();
+        g_pUnifiedWorkspaceSwipe->end();
+        Hyprdrive::DesktopStrip::quickenSwipeRelease(Desktop::focusState()->monitor());
+        // Cancelled (not far or fast enough): still on the tape's desktop, so the
+        // windows settle as a tape swipe would -- snapped, a column focused.
+        const auto WS = m_tapeWorkspace.lock();
+        if (const auto MONITOR = WS ? WS->m_monitor.lock() : PHLMONITOR{}; MONITOR && MONITOR->m_activeWorkspace == WS)
+            SNAPINSIDE();
+        m_mode = EMode::Native;
+        m_tapeWorkspace.reset();
+        return;
+    }
+
+    m_native.end(e);
+    // Its release: as quick as its distance and the fingers' speed (DesktopStrip.hpp).
+    Hyprdrive::DesktopStrip::quickenSwipeRelease(Desktop::focusState()->monitor());
+
+    // AFTER the native end: the release is where it picks the workspace to land
+    // on, and it reads use_r to do it.
+    if (m_forcedUseR) {
+        Hyprdrive::Config::setValue("gestures:workspace_swipe_use_r", m_prevUseR);
+        m_forcedUseR = false;
+    }
+}
+
+void COverviewScrollGesture::begin(const ITrackpadGesture::STrackpadGestureBegin& e) {
+    ITrackpadGesture::begin(e);
+    m_inOverview = false;
+    m_overview.reset();
+
+    if (const auto OVERVIEW = openScrollOverviewForMonitor(Desktop::focusState()->monitor())) {
+        m_inOverview = true;
+        m_overview   = OVERVIEW;
+        return;
+    }
+
+    m_native.begin(e);
+}
+
+void COverviewScrollGesture::update(const ITrackpadGesture::STrackpadGestureUpdate& e) {
+    if (m_inOverview) {
+        const auto OVERVIEW = m_overview.lock();
+        if (auto* const SCROLL = OVERVIEW ? dynamic_cast<COverview*>(OVERVIEW.get()) : nullptr)
+            // Negated like the workspace swipe: the columns stick to the fingers.
+            SCROLL->onTapeSwipeUpdate(-distance(e));
+        return;
+    }
+
+    m_native.update(e);
+}
+
+void COverviewScrollGesture::end(const ITrackpadGesture::STrackpadGestureEnd& e) {
+    if (m_inOverview) {
+        if (const auto OVERVIEW = m_overview.lock()) {
+            if (auto* SCROLL = dynamic_cast<COverview*>(OVERVIEW.get()))
+                SCROLL->onTapeSwipeEnd();
+        }
+        m_overview.reset();
+        m_inOverview = false;
+        return;
+    }
+
+    m_native.end(e);
+}
+
+bool COverviewWorkspaceGesture::isDirectionSensitive() {
+    return true;
+}
+
+namespace {
+
+struct SClickGesture {
+    size_t      fingers         = 3;
+    std::string action;
+    uint32_t    mods            = 0;
+    bool        disableInhibit  = false;
+    std::string arg;
+};
+
+std::vector<SClickGesture>       g_clickGestures;
+std::vector<CHyprSignalListener> g_padListeners;
+size_t                           g_attachedPointerCount = 0;
+uint32_t                         g_padFingers           = 0;
+uint32_t                         g_lastPadFingers       = 0;
+uint32_t                         g_eatButton             = 0;
+bool                             g_padButtonFromTouchpad = false;
+bool                             g_sawSwipeOrPinch       = false;
+Time::steady_tp                  g_lastPadFingersAt{};
+Time::steady_tp                  g_holdBeganAt{};
+
+// OFF unless HYPRDRIVE_CLICK_LOG is set to something other than 0. Every line
+// is an open/write/close of a file on /tmp, and the loudest callers are on the
+// reload and button paths: a config reload alone wrote one line per click
+// gesture re-added and one per pointer device, for a trace nobody reads outside
+// a debugging session. Same shape as FlightController's zdbg, but an env var
+// rather than a key -- the first lines are written before a config exists.
+void clickLog(const char* fmt, ...) {
+    static const bool ENABLED = [] {
+        const char* const V = std::getenv("HYPRDRIVE_CLICK_LOG");
+        return V && *V && std::string_view{V} != "0";
+    }();
+
+    if (!ENABLED)
+        return;
+
+    if (FILE* F = Hyprdrive::DebugPaths::openLog("hyprdrive-click.log")) {
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(F, fmt, ap);
+        va_end(ap);
+        fclose(F);
+    }
+}
+
+void notePadFingers(uint32_t n) {
+    g_padFingers = n;
+    if (n > 0) {
+        g_lastPadFingers   = n;
+        g_lastPadFingersAt = Time::steadyNow();
+    }
+}
+
+// Hold/swipe end. A physical click cancels the hold, then the button event
+// arrives -- keep the last count but restart the clock from the cancel, not
+// from when the fingers first landed (rest-then-click is seconds, not 160ms).
+void notePadFingersEnd(bool keepLast) {
+    g_padFingers = 0;
+    if (keepLast && g_lastPadFingers > 0)
+        g_lastPadFingersAt = Time::steadyNow();
+    else
+        g_lastPadFingers = 0;
+}
+
+uint32_t resolvedPadFingers() {
+    if (g_padFingers >= 2)
+        return g_padFingers;
+    if (g_lastPadFingers >= 2) {
+        const float ago = sc<float>(std::chrono::duration<float, std::milli>(Time::steadyNow() - g_lastPadFingersAt).count());
+        if (ago < 220.F)
+            return g_lastPadFingers;
+    }
+    return 0;
+}
+
+// NOTHING FIRES WHILE LOCKED (marketplace review, #13890). A click gesture, a
+// gesture's key chord and a gesture's dispatcher all act on the session, and
+// the touchpad is in reach of anyone at the lock screen. Each way out of this
+// file checks: dispatchNamed, fireMatchingKeybind, sendGestureChord,
+// tryFireClick; the trackpad gestures themselves are wrapped at registration
+// (CLockedOutGesture, GestureBinds.cpp).
+void dispatchNamed(const std::string& name, const std::string& arg) {
+    if (hyprdriveSessionLocked())
+        return;
+    Hyprdrive::Compat::dispatchNamed(name, arg);
+}
+
+std::string trimCopy(std::string s) {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t'))
+        s.erase(s.begin());
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t'))
+        s.pop_back();
+    return s;
+}
+
+std::string aliasKey(std::string key) {
+    std::string lower = key;
+    std::ranges::transform(lower, lower.begin(), ::tolower);
+    if (lower == "printscreen" || lower == "print_screen" || lower == "prtsc" || lower == "prntscrn" || lower == "print")
+        return "Print";
+    if (lower == "enter" || lower == "return")
+        return "Return";
+    if (lower == "esc" || lower == "escape")
+        return "Escape";
+    if (lower == "space" || lower == "spacebar")
+        return "space";
+    if (lower == "tab")
+        return "TAB";
+    return key;
+}
+
+std::vector<std::string> splitChord(const std::string& spec) {
+    std::string s = spec;
+    for (char& c : s) {
+        if (c == '+' || c == ',')
+            c = ' ';
+    }
+    std::vector<std::string> parts;
+    std::string              cur;
+    for (char c : s) {
+        if (c == ' ' || c == '\t') {
+            if (!cur.empty()) {
+                parts.push_back(trimCopy(cur));
+                cur.clear();
+            }
+        } else
+            cur.push_back(c);
+    }
+    if (!cur.empty())
+        parts.push_back(trimCopy(cur));
+    return parts;
+}
+
+uint32_t resolveXkbKeycode(const std::string& key) {
+    if (!g_pSeatManager)
+        return 0;
+    const auto KB = g_pSeatManager->m_keyboard.lock();
+    if (!KB || !KB->m_xkbKeymap || !KB->m_xkbState)
+        return 0;
+
+    const xkb_keysym_t KEYSYM = xkb_keysym_from_name(key.c_str(), XKB_KEYSYM_CASE_INSENSITIVE);
+    if (KEYSYM == XKB_KEY_NoSymbol)
+        return 0;
+
+    const xkb_keycode_t MIN = xkb_keymap_min_keycode(KB->m_xkbKeymap);
+    const xkb_keycode_t MAX = xkb_keymap_max_keycode(KB->m_xkbKeymap);
+    for (xkb_keycode_t kc = MIN; kc <= MAX; ++kc) {
+        if (xkb_state_key_get_one_sym(KB->m_xkbState, kc) == KEYSYM)
+            return kc;
+    }
+    return 0;
+}
+
+// Run compositor binds that match this chord (Print → screenshot __lua, etc).
+bool fireMatchingKeybind(uint32_t modmask, const std::string& key) {
+    if (!Keybinds::mgr() || hyprdriveSessionLocked())
+        return false;
+    const xkb_keysym_t WANT = xkb_keysym_from_name(key.c_str(), XKB_KEYSYM_CASE_INSENSITIVE);
+    if (WANT == XKB_KEY_NoSymbol)
+        return false;
+
+    bool fired = false;
+    for (const auto& k : Keybinds::mgr()->registry().binds()) {
+        if (!k || !k->enabled() || k->hasFlag(Keybinds::BIND_FLAG_MOUSE) || k->hasFlag(Keybinds::BIND_FLAG_RELEASE))
+            continue;
+        if (!k->metadata().submap.empty())
+            continue;
+        if (k->modifierMask() != Input::ModifierMask{modmask})
+            continue;
+
+        xkb_keysym_t bindSym = XKB_KEY_NoSymbol;
+        if (k->keyNames().size() == 1)
+            bindSym = xkb_keysym_from_name(k->keyNames()[0].c_str(), XKB_KEYSYM_CASE_INSENSITIVE);
+        if (bindSym != WANT)
+            continue;
+
+        clickLog("bind %s mods=%u handler=%s arg=%s\n", key.c_str(), modmask, k->metadata().handler.c_str(), k->metadata().argument.c_str());
+        k->invoke();
+        fired = true;
+        if (!k->hasFlag(Keybinds::BIND_FLAG_NON_CONSUMING))
+            break;
+    }
+    return fired;
+}
+
+void fireClickAction(const SClickGesture& g) {
+    const auto& A = g.action;
+    if (A == "overview") {
+        dispatchNamed("hyprdrive:overview", "toggle all"); // every monitor, like tap-SUPER
+        return;
+    }
+    if (A == "workspace") {
+        dispatchNamed("workspace", "e+1");
+        return;
+    }
+    if (A == "close") {
+        dispatchNamed("killactive", "");
+        return;
+    }
+    if (A == "fullscreen") {
+        dispatchNamed("fullscreen", g.arg.empty() ? "0" : (g.arg == "maximize" ? "1" : "0"));
+        return;
+    }
+    if (A == "maximize") {
+        dispatchNamed("fullscreen", "1");
+        return;
+    }
+    if (A == "float" || A == "tile") {
+        dispatchNamed("togglefloating", "");
+        return;
+    }
+    if (A == "special") {
+        dispatchNamed("togglespecialworkspace", g.arg.empty() ? "special" : g.arg);
+        return;
+    }
+    if (A == "dispatcher" || A == "dispatch") {
+        std::string name = g.arg;
+        std::string data;
+        const auto  SEP = Hyprdrive::Compat::isLuaDispatch(g.arg) ? std::string::npos : g.arg.find_first_of(", ");
+        if (SEP != std::string::npos) {
+            name = g.arg.substr(0, SEP);
+            data = g.arg.substr(SEP + 1);
+            while (!data.empty() && (data.front() == ' ' || data.front() == ','))
+                data.erase(data.begin());
+        }
+        if (!name.empty())
+            dispatchNamed(name, data);
+        return;
+    }
+    if (A == "zoom")
+        dispatchNamed("cursorzoom", g.arg.empty() ? "2" : g.arg);
+    if (A == "keys" || A == "key" || A == "shortcut" || A == "chord")
+        sendGestureChord(g.arg);
+}
+
+bool tryFireClick(uint32_t fingers, uint32_t eatButton) {
+    if (fingers < 2 || g_clickGestures.empty() || hyprdriveSessionLocked())
+        return false;
+    const uint32_t mods = g_pInputManager ? sc<uint32_t>(g_pInputManager->getModsFromAllKBs()) : 0;
+    for (const auto& g : g_clickGestures) {
+        if (g.fingers != fingers)
+            continue;
+        if (g.mods != 0 && (mods & g.mods) != g.mods)
+            continue;
+        clickLog("match %zuf %s arg=%s\n", g.fingers, g.action.c_str(), g.arg.c_str());
+        fireClickAction(g);
+        g_eatButton      = eatButton;
+        g_padFingers     = 0;
+        g_lastPadFingers = 0;
+        return true;
+    }
+    return false;
+}
+
+// Clickfinger only maps 1/2/3-finger clicks to left/right/middle. A 4-finger
+// physical click never becomes a button; libinput reports a short hold instead.
+//
+// A CANCELLED hold is also how every 4-finger swipe and pinch STARTS: libinput
+// ends the hold the moment the fingers move and only then begins the swipe or
+// pinch, so at this point g_sawSwipeOrPinch is still false. Firing here closed
+// the window at the start of a 4-finger pinch, fingers still down (user,
+// 2026-09-24: "window closing before fingers lifted from trackpad"). A cancelled
+// hold therefore waits HOLD_CANCEL_GRACE_MS and fires only if no swipe or pinch
+// began in the meantime -- they begin in the same input frame as the cancel.
+constexpr int    HOLD_CANCEL_GRACE_MS = 80;
+wl_event_source* g_holdClickTimer     = nullptr;
+uint32_t         g_holdClickFingers   = 0;
+
+int holdClickTimerCb(void*) {
+    clickLog("holdClick deferred: swipe=%d\n", g_sawSwipeOrPinch ? 1 : 0);
+    if (!g_sawSwipeOrPinch)
+        tryFireClick(g_holdClickFingers, 0);
+    return 0;
+}
+
+void maybeClickFromHold(bool cancelled) {
+    const uint32_t fingers = g_padFingers >= 2 ? g_padFingers : g_lastPadFingers;
+    const float    dur     = sc<float>(std::chrono::duration<float, std::milli>(Time::steadyNow() - g_holdBeganAt).count());
+    clickLog("holdClick? fingers=%u dur=%.0f swipe=%d cancelled=%d\n", fingers, dur, g_sawSwipeOrPinch ? 1 : 0, cancelled ? 1 : 0);
+    if (g_sawSwipeOrPinch || fingers < 4)
+        return;
+    if (dur < 0.F || dur > 800.F)
+        return;
+
+    if (!cancelled) {
+        tryFireClick(fingers, 0);
+        return;
+    }
+
+    if (!g_holdClickTimer && g_pCompositor)
+        g_holdClickTimer = wl_event_loop_add_timer(g_pCompositor->m_wlEventLoop, holdClickTimerCb, nullptr);
+    if (!g_holdClickTimer)
+        return; // no way to wait: a missed click beats a closed window
+    g_holdClickFingers = fingers;
+    wl_event_source_timer_update(g_holdClickTimer, HOLD_CANCEL_GRACE_MS);
+}
+
+// What a TOUCHPAD's events do to the click-gesture state, one function per
+// event. attachPadFingerListeners hangs them on every pointer device; the
+// debug gesture hook (DebugGesture.cpp) calls the same ones through the pad*
+// entry points below, so a headless test runs this exact code.
+void onPadHoldBegin(uint32_t fingers) {
+    clickLog("holdBegin fingers=%u\n", fingers);
+    g_sawSwipeOrPinch = false;
+    g_holdBeganAt     = Time::steadyNow();
+    notePadFingers(fingers);
+}
+
+void onPadHoldEnd(bool cancelled) {
+    clickLog("holdEnd cancelled=%d last=%u\n", cancelled ? 1 : 0, g_lastPadFingers);
+    maybeClickFromHold(cancelled);
+    notePadFingersEnd(cancelled);
+}
+
+void onPadGestureBegin(uint32_t fingers) {
+    g_sawSwipeOrPinch = true;
+    notePadFingers(fingers);
+}
+
+// Clickfinger (Omarchy default, and what user.trackpad-gestures used) maps
+// 1/2/3-finger physical clicks to left/right/middle. The old plugin bound
+// o.bind("mouse:274", screenshot). Hyprland sets event.mouse=true on pads,
+// so we have to recognize BTN_MIDDLE on the touchpad device itself.
+//
+// BEFORE the press reaches the bus (noteButtonDevice, from main.cpp's
+// CInputManager::onMouseButton hook), never from the device's own button
+// signal: that listener is attached after Hyprland's, which is the one that
+// runs onMouseButton and so the bus -- it saw each press only AFTER
+// handleClickGestureButton had already judged it, by the PREVIOUS press's
+// device. A mouse's middle click after any touchpad click then read as a
+// 3-finger click: the overview toggled and the paste was eaten (found with
+// the debug hook's `button`, 2026-10-15).
+void onPadButton(bool isPad, const IPointer::SButtonEvent& e) {
+    if (e.state != WL_POINTER_BUTTON_STATE_PRESSED)
+        return;
+    g_padButtonFromTouchpad = isPad;
+    if (!isPad || e.button != BTN_MIDDLE)
+        return;
+    if (resolvedPadFingers() >= 4)
+        return;
+    notePadFingers(3);
+}
+
+} // namespace
+
+void padHoldBegin(uint32_t fingers) {
+    onPadHoldBegin(fingers);
+}
+
+void padHoldEnd(bool cancelled) {
+    onPadHoldEnd(cancelled);
+}
+
+void padGestureBegin(uint32_t fingers) {
+    onPadGestureBegin(fingers);
+}
+
+void padGestureUpdate(uint32_t fingers) {
+    notePadFingers(fingers);
+}
+
+void padGestureEnd(bool cancelled) {
+    notePadFingersEnd(cancelled);
+}
+
+void noteButtonDevice(bool fromTouchpad, const IPointer::SButtonEvent& event) {
+    onPadButton(fromTouchpad, event);
+}
+
+void padButton(uint32_t button, bool pressed) {
+    const IPointer::SButtonEvent E{
+        .timeMs = sc<uint32_t>(Time::millis(Time::steadyNow())),
+        .button = button,
+        .state  = pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED,
+        .mouse  = true, // what Hyprland sets on a touchpad's buttons too
+    };
+    // What the onMouseButton hook does first (flag the press as the pad's),
+    // then the bus event onMouseButton itself emits: the click gestures
+    // (handleClickGestureButton), the overview and the dock all take it there.
+    onPadButton(true, E);
+    Event::SCallbackInfo info;
+    Event::bus()->m_events.input.mouse.button.emit(E, info);
+}
+
+void sendGestureChord(const std::string& chord) {
+    auto parts = splitChord(chord);
+    if (parts.empty() || hyprdriveSessionLocked())
+        return;
+
+    std::string key = aliasKey(parts.back());
+    parts.pop_back();
+
+    uint32_t modmask = 0;
+    if (Keybinds::mgr()) {
+        for (auto& p : parts)
+            modmask |= sc<uint32_t>(Keybinds::modMaskFromString(p));
+    }
+
+    clickLog("chord '%s' key=%s mods=%u\n", chord.c_str(), key.c_str(), modmask);
+
+    // Print (and any other chord that is a compositor bind) must run the bind,
+    // not get passed into the focused app.
+    if (fireMatchingKeybind(modmask, key))
+        return;
+
+    const uint32_t keycode = resolveXkbKeycode(key);
+    if (!keycode) {
+        clickLog("chord: no keycode for %s\n", key.c_str());
+        return;
+    }
+    clickLog("pass mods=%u keycode=%u\n", modmask, keycode);
+    const auto passResult = Config::Actions::pass(Input::ModifierMask{modmask}, keycode, std::nullopt);
+    if (!passResult)
+        clickLog("pass failed: %s\n", passResult.error().message.c_str());
+}
+
+void CKeysTrackpadGesture::end(const ITrackpadGesture::STrackpadGestureEnd&) {
+    sendGestureChord(m_chord);
+}
+
+void clearClickGestures() {
+    g_clickGestures.clear();
+}
+
+void shutdownClickGestures() {
+    if (g_holdClickTimer) {
+        wl_event_source_remove(g_holdClickTimer);
+        g_holdClickTimer = nullptr;
+    }
+    // The per-pointer hold/swipe/pinch listeners: their lambdas are this .so's
+    // code, and until now only the static destructors at dlclose let them go.
+    g_padListeners.clear();
+    g_attachedPointerCount = 0;
+}
+
+void addClickGesture(size_t fingers, const std::string& action, uint32_t mods, bool disableInhibit, const std::string& arg) {
+    removeClickGesture(fingers, mods);
+    g_clickGestures.push_back(SClickGesture{fingers, action, mods, disableInhibit, arg});
+    clickLog("addClick %zu %s arg=%s mods=%u\n", fingers, action.c_str(), arg.c_str(), mods);
+}
+
+void removeClickGesture(size_t fingers, uint32_t mods) {
+    std::erase_if(g_clickGestures, [&](const SClickGesture& g) { return g.fingers == fingers && g.mods == mods; });
+}
+
+// Idempotent, and deliberately so: this is called from the config.reloaded
+// listener, and a reload is not a reason to rebuild anything here. Tearing the
+// listeners down and putting them back cost ~10 signal registrations per
+// pointer device AND zeroed g_padFingers, which threw away a 4-finger hold that
+// was still under the hand -- a theme switch mid-gesture cancelled the gesture.
+// The listeners are attached to the POINTER SET, so that is the only thing that
+// can make them stale; handleClickGestureButton watches the same count.
+void attachPadFingerListeners() {
+    if (!g_pInputManager) {
+        g_padListeners.clear();
+        g_attachedPointerCount = 0;
+        return;
+    }
+
+    if (!g_padListeners.empty() && g_pInputManager->m_pointers.size() == g_attachedPointerCount)
+        return;
+
+    g_padListeners.clear();
+    g_attachedPointerCount = g_pInputManager->m_pointers.size();
+    for (auto& ptr : g_pInputManager->m_pointers) {
+        if (!ptr)
+            continue;
+        g_padListeners.emplace_back(ptr->m_pointerEvents.holdBegin.listen([](IPointer::SHoldBeginEvent e) { onPadHoldBegin(e.fingers); }));
+        g_padListeners.emplace_back(ptr->m_pointerEvents.holdEnd.listen([](IPointer::SHoldEndEvent e) { onPadHoldEnd(e.cancelled); }));
+        g_padListeners.emplace_back(ptr->m_pointerEvents.swipeBegin.listen([](IPointer::SSwipeBeginEvent e) { onPadGestureBegin(e.fingers); }));
+        g_padListeners.emplace_back(ptr->m_pointerEvents.swipeUpdate.listen([](IPointer::SSwipeUpdateEvent e) { notePadFingers(e.fingers); }));
+        g_padListeners.emplace_back(ptr->m_pointerEvents.swipeEnd.listen([](IPointer::SSwipeEndEvent e) { notePadFingersEnd(e.cancelled); }));
+        g_padListeners.emplace_back(ptr->m_pointerEvents.pinchBegin.listen([](IPointer::SPinchBeginEvent e) { onPadGestureBegin(e.fingers); }));
+        g_padListeners.emplace_back(ptr->m_pointerEvents.pinchUpdate.listen([](IPointer::SPinchUpdateEvent e) { notePadFingers(e.fingers); }));
+        g_padListeners.emplace_back(ptr->m_pointerEvents.pinchEnd.listen([](IPointer::SPinchEndEvent e) { notePadFingersEnd(e.cancelled); }));
+        // No button listener: see onPadButton (noteButtonDevice).
+    }
+    clickLog("attachPadFingerListeners pointers=%zu listeners=%zu\n", g_attachedPointerCount, g_padListeners.size());
+}
+
+bool handleClickGestureButton(const IPointer::SButtonEvent& event) {
+    if (g_pInputManager && g_pInputManager->m_pointers.size() != g_attachedPointerCount)
+        attachPadFingerListeners();
+
+    if (event.state != WL_POINTER_BUTTON_STATE_PRESSED) {
+        if (g_eatButton && event.button == g_eatButton) {
+            g_eatButton = 0;
+            return true;
+        }
+        return false;
+    }
+    if (g_clickGestures.empty())
+        return false;
+
+    uint32_t fingers = resolvedPadFingers();
+    // Same mapping as user.trackpad-gestures: clickfinger 3-finger click is
+    // BTN_MIDDLE (mouse:274). Keep a 4-finger hold if we already saw one.
+    if (g_padButtonFromTouchpad && event.button == BTN_MIDDLE && fingers < 3)
+        fingers = 3;
+
+    clickLog("button btn=%u mouse=%d pad=%d fingers=%u current=%u last=%u gestures=%zu\n", event.button, event.mouse ? 1 : 0, g_padButtonFromTouchpad ? 1 : 0, fingers,
+             g_padFingers, g_lastPadFingers, g_clickGestures.size());
+
+    return tryFireClick(fingers, event.button);
+}
+
+void CCanvasZoomGesture::begin(const ITrackpadGesture::STrackpadGestureBegin& e) {
+    ITrackpadGesture::begin(e);
+    m_delta = 0.F;
+    m_mode  = Hyprdrive::Mosaic::fingerZoomBegin();
+    if (m_mode == 0)
+        m_overview.begin(e);
+}
+
+void CCanvasZoomGesture::update(const ITrackpadGesture::STrackpadGestureUpdate& e) {
+    if (m_mode == 0) {
+        m_overview.update(e);
+        return;
+    }
+    // Signed: the fingers going back undo it, clamped to the gesture's length.
+    const float MAX = std::max(1.F, sc<float>(Hyprdrive::Config::getGestureDistance()));
+    m_delta         = std::clamp(m_delta + distance(e), 0.F, MAX);
+    const double T  = m_delta / MAX;
+    Hyprdrive::Mosaic::fingerZoomFollow(m_mode > 0 ? T : 1.0 - T);
+}
+
+void CCanvasZoomGesture::end(const ITrackpadGesture::STrackpadGestureEnd& e) {
+    if (m_mode == 0) {
+        m_overview.end(e);
+        return;
+    }
+    const bool   CANCELLED = e.swipe && e.swipe->cancelled;
+    const double Z         = Hyprdrive::Mosaic::fingerZoomLevel();
+    // Out past a third of the way (back in: in past a third of the way back).
+    const bool OUT = m_mode > 0 ? !CANCELLED && Z >= 1.0 / 3.0 : CANCELLED || Z > 2.0 / 3.0;
+    Hyprdrive::Mosaic::fingerZoomEnd(OUT);
+    m_mode = 0;
+}
+
+void CHyprdriveForwardGesture::begin(const ITrackpadGesture::STrackpadGestureBegin& e) {
+    ITrackpadGesture::begin(e);
+    m_active = nullptr;
+    if (scrollOverviewForMonitor(Desktop::focusState()->monitor()))
+        return;
+    m_active = pick();
+    if (m_active)
+        m_active->begin(e);
+}
+
+void CHyprdriveForwardGesture::update(const ITrackpadGesture::STrackpadGestureUpdate& e) {
+    if (m_active)
+        m_active->update(e);
+}
+
+void CHyprdriveForwardGesture::end(const ITrackpadGesture::STrackpadGestureEnd& e) {
+    if (m_active)
+        m_active->end(e);
+    m_active = nullptr;
+}
+
+// A CLOSE THAT FOLLOWS THE FINGERS (user, 2026-10-08: "4 fingers up to show
+// scratchpad follows my gestures but 4 fingers down does not to close it").
+// Hyprland's CSpecialWorkspaceGesture (0.56.2) moves between each animated
+// value's begun() and goal(), read at begin. A reveal BY GESTURE ends with
+// `*var = goal` on a var its updates already warped to that goal -- a no-op
+// that leaves begun() == goal() == open. The close gesture then lerps open ->
+// open: nothing moves under the fingers and the scratchpad snaps shut on
+// release. (Opened by a key, the open animation leaves begun() at closed, and
+// the close follows.)
+//
+// So: a reveal records the closed look it starts from (the native gesture's own
+// From values, read right after its begin), and a close whose vars have lost
+// it gets it back before the native begin reads them -- setValue(closed) then
+// warp(): value and goal are back at open and begun() is closed, in one
+// synchronous step with no frame between, so nothing visibly moves.
+namespace {
+    struct SClosedLook {
+        float    fade = 0.F, dim = 0.F, blur = 0.F, alpha = 0.F;
+        Vector2D offset;
+    };
+    std::unordered_map<std::string, SClosedLook> g_closedLook; // special workspace name -> its closed look
+
+    template <typename T>
+    void giveBackBegun(const PHLANIMVAR<T>& var, const T& closed) {
+        if (!var || var->begun() != var->goal() || var->goal() == closed || var->value() != var->goal())
+            return; // it still knows where it came from, or it is mid-animation: leave it
+        var->setValue(closed);
+        var->warp(false);
+    }
+}
+
+void CScratchpadGesture::begin(const ITrackpadGesture::STrackpadGestureBegin& e) {
+    const auto MONITOR = Desktop::focusState()->monitor();
+    if (!m_show && MONITOR) {
+        if (const auto SHOWN = Hyprdrive::Scratchpad::shownOn(MONITOR); SHOWN && SHOWN->m_monitor) {
+            if (const auto IT = g_closedLook.find(SHOWN->displayName()); IT != g_closedLook.end()) {
+                const auto  MON = SHOWN->m_monitor.lock();
+                const auto& C   = IT->second;
+                giveBackBegun(MON->m_specialFade, C.fade);
+                giveBackBegun(MON->m_specialDim, C.dim);
+                giveBackBegun(MON->m_specialBlur, C.blur);
+                giveBackBegun(SHOWN->m_alpha, C.alpha);
+                giveBackBegun(SHOWN->m_renderOffset, C.offset);
+            }
+        }
+    }
+
+    m_native.reset(); // pick() sets it only when it picks one, this time
+    CHyprdriveForwardGesture::begin(e);
+
+    // A reveal started: the native gesture just read its From values -- the
+    // closed look -- out of these same begun()s.
+    if (m_show && m_native && MONITOR)
+        if (const auto WS = Hyprdrive::Scratchpad::shownOn(MONITOR); WS && WS->m_monitor) {
+            const auto MON         = WS->m_monitor.lock();
+            g_closedLook[WS->displayName()] = SClosedLook{
+                .fade   = MON->m_specialFade->begun(),
+                .dim    = MON->m_specialDim->begun(),
+                .blur   = MON->m_specialBlur->begun(),
+                .alpha  = WS->m_alpha->begun(),
+                .offset = WS->m_renderOffset->begun(),
+            };
+        }
+}
+
+ITrackpadGesture* CScratchpadGesture::pick() {
+    const auto MONITOR = Desktop::focusState()->monitor();
+    if (!MONITOR)
+        return nullptr;
+
+    const auto SHOWN  = Hyprdrive::Scratchpad::shownOn(MONITOR);
+    const auto TARGET = m_show ? (SHOWN ? PHLWORKSPACE{} : Hyprdrive::Scratchpad::ensureDefault(MONITOR)) : SHOWN;
+    if (!TARGET)
+        return nullptr;
+
+    // The native gesture looks the workspace up as "special:" + name.
+    std::string name = TARGET->displayName();
+    if (name.starts_with("special:"))
+        name = name.substr(8);
+    m_native = std::make_unique<CSpecialWorkspaceGesture>(name);
+    return m_native.get();
+}
+
+ITrackpadGesture* CFullscreenOrCloseGesture::pick() {
+    const auto WINDOW = Desktop::focusState()->window();
+    if (!WINDOW)
+        return nullptr;
+
+    const bool FULL = Fullscreen::controller()->isFullscreen(WINDOW);
+    if (m_enter)
+        return FULL ? nullptr : &m_fullscreen;
+    return FULL ? sc<ITrackpadGesture*>(&m_fullscreen) : sc<ITrackpadGesture*>(&m_close);
+}
+
+// The native close gesture's travel is 200 of its units; this is how many times
+// further the fingers go, and what fraction of THAT they must still be past on
+// release for the window to close.
+static constexpr float CLOSE_NATIVE_TRAVEL = 200.F;
+static constexpr float CLOSE_TRAVEL        = 1.75F; // user, 2026-09-24: 2.5 was too hard; halfway to native 1.0
+static constexpr float CLOSE_COMMIT        = 0.5F;  // halfway between native 0.2 and 0.8
+
+void CGuardedCloseGesture::begin(const ITrackpadGesture::STrackpadGestureBegin& e) {
+    auto scaled  = e;
+    scaled.scale = e.scale / CLOSE_TRAVEL;
+    m_userScale  = e.scale;
+    ITrackpadGesture::begin(scaled); // this object tracks the same total the native one does
+    m_native.begin(scaled);
+    m_delta = 0.F;
+    m_dir   = e.direction;
+    m_lastPinch.reset();
+    m_lastSwipe.reset();
+}
+
+void CGuardedCloseGesture::update(const ITrackpadGesture::STrackpadGestureUpdate& e) {
+    auto scaled  = e;
+    scaled.scale = m_userScale / CLOSE_TRAVEL;
+    m_delta += distance(scaled);
+    m_dir = e.direction;
+    if (e.pinch)
+        m_lastPinch = *e.pinch;
+    if (e.swipe)
+        m_lastSwipe = *e.swipe;
+    m_native.update(scaled);
+}
+
+void CGuardedCloseGesture::end(const ITrackpadGesture::STrackpadGestureEnd& e) {
+    const bool CANCELLED = (e.pinch && e.pinch->cancelled) || (e.swipe && e.swipe->cancelled);
+    const bool COMMIT    = !CANCELLED && m_delta >= CLOSE_NATIVE_TRAVEL * CLOSE_COMMIT;
+
+    if (!COMMIT && m_delta != 0.F) {
+        // One update that takes the native total back to exactly zero, built
+        // from the same formula ITrackpadGesture::distance applies to it.
+        const float MS = m_userScale / CLOSE_TRAVEL; // the native gesture's m_scale
+        ITrackpadGesture::STrackpadGestureUpdate rewind{.direction = m_dir, .scale = MS};
+        IPointer::SPinchUpdateEvent              pinch;
+        IPointer::SSwipeUpdateEvent              swipe;
+        bool                                     built = false;
+
+        if (m_lastPinch && (m_dir == TRACKPAD_GESTURE_DIR_PINCH || m_dir == TRACKPAD_GESTURE_DIR_PINCH_IN || m_dir == TRACKPAD_GESTURE_DIR_PINCH_OUT)) {
+            // distance = MS * 400 * (PINCH_IN ? -Δ : 1.6Δ), Δ = lastScale - newScale
+            const float PER = MS * 400.F * (m_dir == TRACKPAD_GESTURE_DIR_PINCH_IN ? -1.F : 1.6F);
+            pinch           = *m_lastPinch;
+            pinch.delta     = {};
+            pinch.scale     = m_lastPinch->scale + sc<double>(m_delta / PER);
+            rewind.pinch    = &pinch;
+            built           = true;
+        } else if (m_lastSwipe) {
+            swipe       = *m_lastSwipe;
+            swipe.delta = {};
+            switch (m_dir) {
+                case TRACKPAD_GESTURE_DIR_UP: swipe.delta.y = m_delta / MS; built = true; break;
+                case TRACKPAD_GESTURE_DIR_DOWN:
+                case TRACKPAD_GESTURE_DIR_VERTICAL: swipe.delta.y = -m_delta / MS; built = true; break;
+                case TRACKPAD_GESTURE_DIR_LEFT: swipe.delta.x = m_delta / MS; built = true; break;
+                case TRACKPAD_GESTURE_DIR_RIGHT:
+                case TRACKPAD_GESTURE_DIR_HORIZONTAL: swipe.delta.x = -m_delta / MS; built = true; break;
+                default: break; // a SWIPE's distance is a length and cannot go back
+            }
+            rewind.swipe = &swipe;
+        }
+
+        if (built)
+            m_native.update(rewind);
+    }
+
+    m_native.end(e);
+}

@@ -1,0 +1,1307 @@
+#include "OverviewRender.hpp"
+#include "IdentityLive.hpp"
+#include "OverviewPassElement.hpp"
+#include "Look.hpp"
+#include <chrono>
+#include <cstring>
+#include <vector>
+#include <filesystem>
+#include <algorithm>
+#include <cmath>
+#include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/render/Context.hpp>
+#include <hyprland/src/helpers/math/Math.hpp>
+#include <hyprland/src/render/pass/BorderPassElement.hpp>
+#include <hyprland/src/render/pass/RectPassElement.hpp>
+#include <hyprland/src/render/gl/GLTexture.hpp>
+#include <drm_fourcc.h>
+#include <pango/pangocairo.h>
+#include <format>
+#include <hyprgraphics/image/Image.hpp>
+#include "AppSearch.hpp"
+#include "IconSize.hpp"
+#include "ImageGuard.hpp"
+#include "BuiltinIcons.hpp"
+#include "Fonts.hpp"
+#include "Glyphs.hpp"
+#include "Config.hpp"
+#include "BorderFade.hpp"
+#include "PlateColor.hpp"
+#include <hyprland/src/render/pass/TexPassElement.hpp>
+#include <hyprland/src/render/pass/ClearPassElement.hpp>
+#include "globals.hpp"
+#include "IOverview.hpp"
+#include "SearchSession.hpp"
+#include "SearchBackend.hpp"
+#include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/output/Monitor.hpp>
+#include <unordered_set>
+#include <hyprland/src/Compositor.hpp>
+#include <hyprland/src/desktop/state/WindowState.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include "HyprCompat.hpp"
+#include <hyprland/src/render/OpenGL.hpp>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+
+namespace OverviewRender {
+
+// X92. Private FB holding the overview chrome blur for the rest of the frame.
+// g_frameChromeBlur is always chromeBlurFB->getTexture() when valid -- never a
+// transient blurMainFramebuffer() result.
+//
+// One PER MONITOR: every monitor's overview captures it at the start of its own
+// frame, and the monitors are different sizes -- a single framebuffer was freed
+// and reallocated at the other monitor's size on every frame of both.
+static std::unordered_map<MONITORID, SP<Render::IFramebuffer>> g_chromeBlurFBs;
+static SP<Render::ITexture>     g_frameChromeBlur;
+
+SP<Render::ITexture> frameChromeBlur() {
+    return g_frameChromeBlur;
+}
+
+void clearFrameChromeBlur() {
+    g_frameChromeBlur.reset();
+}
+
+// Y17 (GPU, 2026-09-14). WHY THIS STILL BLURS THE WHOLE MONITOR.
+//
+// Only a handful of boxes sample the result -- the strip plate, the alternate
+// monitor plates, the scratchpad plate, the search results container and the
+// detent badge -- so restricting the kawase to their union plus a margin is the
+// obvious saving. It is NOT taken, and the reason is X96, three screens down in
+// OverviewPassElement::draw: thin damage under-delivered the pass pyramid on a
+// strip/dock/pill compared to a large window surface even with size and passes
+// matching on paper. Reading Hyprland 0.56.2 back (OpenGL.cpp
+// blurFramebufferWithDamage) says why that is not just a margin bug:
+//
+//   * the damage is expanded by size * 2^passes once, then each downsample
+//     pass scissors to damage.scale(1 / 2^i) -- an integer-rounded region, so a
+//     band a few hundred px tall collapses toward nothing at i = 4 and the
+//     deepest passes write fewer texels than a full-screen run does;
+//   * PMIRRORFB/PMIRRORSWAPFB come from getUnusedWorkBuffer(), i.e. a pool
+//     shared with every other blur in the frame, so anything the scissor does
+//     not cover is another consumer's leftovers rather than a stale copy of
+//     this one;
+//   * the prepare and finish passes read those same texels through a LINEAR
+//     filter, so "outside the scissor" leaks inward at the seams.
+//
+// None of that can be proven safe by reading alone, and the rule for this work
+// is that the pixels do not move. So the capture stays full-monitor and is
+// instead SKIPPED ENTIRELY when nothing samples it (Overview.cpp, the
+// overviewGridProgress gate at its call site), which is a whole-frame saving
+// rather than a fractional one and cannot change a pixel.
+void captureFrameChromeBlur(PHLMONITOR monitor) {
+    g_frameChromeBlur.reset();
+    if (!monitor || !g_pHyprRenderer)
+        return;
+    auto& ctx = g_pHyprRenderer->context();
+    if (!ctx.m_data.currentFB)
+        return;
+
+    const auto FBSIZE     = monitor->m_pixelSize;
+    const auto RENDERSIZE = monitor->m_transformedSize;
+    const auto FBFORMAT   = ctx.m_data.currentFB->m_drmFormat;
+
+    auto& g_chromeBlurFB = g_chromeBlurFBs[monitor->m_id];
+    if (!g_chromeBlurFB)
+        g_chromeBlurFB = g_pHyprRenderer->createFB("hyprdrive_chrome_blur");
+
+    if (!g_chromeBlurFB || !g_chromeBlurFB->isAllocated() || g_chromeBlurFB->m_size != FBSIZE || g_chromeBlurFB->m_drmFormat != FBFORMAT) {
+        if (g_chromeBlurFB)
+            g_chromeBlurFB->release();
+        if (!g_chromeBlurFB || !g_chromeBlurFB->alloc(sc<int>(FBSIZE.x), sc<int>(FBSIZE.y), FBFORMAT))
+            return;
+    }
+
+    g_chromeBlurFB->setImageDescription(ctx.m_data.currentFB->imageDescription());
+
+    CRegion fullDamage{CBox{0, 0, RENDERSIZE.x, RENDERSIZE.y}};
+    // X99. This private FB is only sampled by the strip and the search-result
+    // chrome (the pill and the dock blur live). It used to run one pass weaker
+    // than window frost; Y12 below took that out.
+    // Y12 (user, 2026-08-06): "remove the -1 passes". X99 dual-kawased this
+    // capture at `max(1, passes - 1)` so the strip and the result cards would
+    // read one step softer than the windows. The user wants chrome frost to be
+    // the SAME blur the windows get, so the capture now runs at the configured
+    // pass count and the scope guard below is left in place only because the
+    // shader still reads the value globally.
+    const int PREV_PASSES   = Hyprdrive::Config::getValue<int>("decoration:blur:passes");
+    const int CHROME_PASSES = PREV_PASSES;
+    Hyprdrive::Config::setValue("decoration:blur:passes", CHROME_PASSES);
+    auto restorePasses = Hyprutils::Utils::CScopeGuard([PREV_PASSES] {
+        Hyprdrive::Config::setValue("decoration:blur:passes", PREV_PASSES);
+    });
+
+    // Dual-kawase the CURRENT overview main FB (cards + tiles if already drawn).
+    const auto BLURREDFB = g_pHyprRenderer->blurMainFramebuffer(ctx, 1.F, fullDamage);
+    const auto BLURRED   = BLURREDFB ? BLURREDFB->getTexture() : nullptr;
+    if (!BLURRED || !BLURRED->ok())
+        return;
+
+    // COPY into our FB so later window/dock live blurs cannot stomp it.
+    {
+        auto bindChrome = g_pHyprRenderer->bindTempFB(ctx, g_chromeBlurFB);
+
+        const auto SAVEDDAMAGE = ctx.m_data.damage;
+        ctx.m_data.damage      = fullDamage;
+        auto       restoreDamage = Hyprutils::Utils::CScopeGuard([SAVEDDAMAGE, &ctx] { ctx.m_data.damage = SAVEDDAMAGE; });
+
+        g_pHyprRenderer->draw(ctx, CClearPassElement::SClearData{CHyprColor{0.F, 0.F, 0.F, 0.F}}, fullDamage);
+
+        const auto SAVEDTRANSFORM = BLURRED->m_transform;
+        BLURRED->m_transform      = Math::wlTransformToHyprutils(Math::invertTransform(monitor->m_transform));
+        auto restoreTransform     = Hyprutils::Utils::CScopeGuard([BLURRED, SAVEDTRANSFORM] { BLURRED->m_transform = SAVEDTRANSFORM; });
+
+        g_pHyprRenderer->draw(
+            ctx,
+            CTexPassElement::SRenderData{
+                .tex    = BLURRED,
+                .box    = CBox{0, 0, RENDERSIZE.x, RENDERSIZE.y},
+                .damage = fullDamage,
+            },
+            fullDamage);
+    }
+
+    g_frameChromeBlur = g_chromeBlurFB->getTexture();
+}
+
+
+// Decode size for app icons asked for WITHOUT a size (the overview's rows and
+// tiles). SVG rasterises at whatever size it is asked for, so this is picked
+// once, generously, and scaled down when drawn -- the row height changes with
+// the card transform and re-decoding per frame would be absurd. A raster file
+// ignores it and arrives at its own size.
+//
+// A caller that knows the size it draws at (the dock, the stacks) passes it
+// instead: see IconSize.hpp -- the texture is then resampled to exactly that
+// size, because GL_LINEAR with no mipmaps aliases anything drawn much smaller
+// than it is.
+static constexpr int OVERVIEW_APP_ICON_PX = 64;
+
+// How many SIZED textures of one icon are kept: a dock per monitor scale and
+// the stacks' popup sizes in steady use; a dock size slider dragged walks
+// through more, and the least recently drawn goes.
+static constexpr size_t APP_ICON_SIZES_KEPT = 4;
+
+// Icon name -> texture, built once. NULL entries are cached too: an icon that
+// failed to resolve must not be re-searched on every single frame.
+//
+// Each entry remembers the FILE it was decoded from and the icon-index
+// generation it was checked against. A rebuilt index used to drop every
+// texture, and the index is rebuilt more often than it looks: the dock stacks'
+// other-theme index finishing in the background bumps it too. So the first
+// overview after one re-decoded ~15 icons (~30 ms) right on the opening frames.
+// Now a stale entry re-resolves its name -- a map lookup -- and only an icon
+// whose file actually changed is decoded again.
+struct SAppIcon {
+    SP<Render::ITexture> texture;
+    std::string          path;
+    uint64_t             gen = 0;
+    std::string          base;        // the key without the size: name + tint + pad
+    int                  bucket  = 0; // IconSize::bucket of the draw, 0 = unsized
+    uint64_t             lastUse = 0; // g_appIconUse when last drawn
+};
+static std::unordered_map<std::string, SAppIcon> g_overviewAppIcons;
+static uint64_t                                  g_appIconUse = 0;
+
+// The tinted and untinted textures are different pixels, so they are
+// different cache entries, and so is every size. \x01 \x02 \x03 cannot appear
+// in an icon name.
+static std::string appIconBaseKey(const std::string& iconName, bool tintWhite, bool padded) {
+    return (tintWhite ? iconName + "\x01white" : iconName) + (padded ? "\x03pad" : "");
+}
+static std::string appIconKey(const std::string& base, int bucket) {
+    return bucket > 0 ? base + "\x02" + std::to_string(bucket) : base;
+}
+
+static std::string resolveAppIconPath(const std::string& iconName) {
+    if (iconName.starts_with('@')) {
+        if (const auto COLON = iconName.find(':'); COLON != std::string::npos)
+            return AppSearch::resolveIconPathInTheme(iconName.substr(COLON + 1), iconName.substr(1, COLON - 1));
+        return "";
+    }
+    return AppSearch::resolveIconPath(iconName);
+}
+
+// True when `iconName` (untinted, unpadded, at `px`) is decoded and still current.
+static bool appIconWarm(const std::string& iconName, double px) {
+    const auto IT = g_overviewAppIcons.find(appIconKey(iconName, IconSize::bucket(px)));
+    if (IT == g_overviewAppIcons.end())
+        return false;
+    const auto GEN = AppSearch::iconIndexGeneration();
+    if (IT->second.gen == GEN)
+        return true;
+    if (resolveAppIconPath(iconName) != IT->second.path)
+        return false;
+    IT->second.gen = GEN;
+    return true;
+}
+
+// An image FILE -> texture (dock stacks A: the pile's and pane's thumbnails),
+// decoded and uploaded exactly as appIcon does. Keyed on path + size + mtime,
+// so a replaced thumbnail is picked up; bounded, and cleared at unload.
+static std::unordered_map<std::string, SP<Render::ITexture>> g_imageFiles;
+
+// Upload `data` inside a TEX_PAD transparent border (see appIcon's `padded`).
+static SP<Render::ITexture> uploadPadded(const uint8_t* data, int w, int h, int stride, uint32_t format) {
+    const int            P = TEX_PAD, W2 = w + 2 * P, H2 = h + 2 * P;
+    std::vector<uint8_t> buf(sc<size_t>(W2) * sc<size_t>(H2) * 4, 0);
+    for (int y = 0; y < h; ++y) {
+        auto* dst = buf.data() + (sc<size_t>(y + P) * W2 + P) * 4;
+        std::memcpy(dst, data + sc<size_t>(y) * stride, sc<size_t>(w) * 4);
+        if (format == DRM_FORMAT_XRGB8888)
+            for (int x = 0; x < w; ++x)
+                dst[x * 4 + 3] = 255; // no alpha in the source: opaque, and the border stays clear
+    }
+    return makeShared<Render::GL::CGLTexture>(DRM_FORMAT_ARGB8888, buf.data(), sc<uint32_t>(W2 * 4), Vector2D{sc<double>(W2), sc<double>(H2)});
+}
+
+CBox padBox(const CBox& box, const SP<Render::ITexture>& tex) {
+    if (!tex || tex->m_size.x <= 2 * TEX_PAD || tex->m_size.y <= 2 * TEX_PAD)
+        return box;
+    const double FX = box.width * TEX_PAD / (tex->m_size.x - 2.0 * TEX_PAD), FY = box.height * TEX_PAD / (tex->m_size.y - 2.0 * TEX_PAD);
+    CBox         out{box.x - FX, box.y - FY, box.width + 2 * FX, box.height + 2 * FY};
+    out.rot = box.rot;
+    return out;
+}
+
+SP<Render::ITexture> imageFile(const std::string& path, int px, bool budgeted, bool padded) {
+    if (path.empty() || px < 1)
+        return nullptr;
+    std::error_code ec;
+    const auto      MT  = std::filesystem::last_write_time(path, ec);
+    const auto      KEY = path + "\x01" + std::to_string(px) + "\x01" + std::to_string(ec ? 0 : MT.time_since_epoch().count()) + (padded ? "\x03pad" : "");
+    if (const auto IT = g_imageFiles.find(KEY); IT != g_imageFiles.end())
+        return IT->second;
+    if (g_imageFiles.size() > 256)
+        g_imageFiles.clear();
+
+    static auto  windowStart = std::chrono::steady_clock::now();
+    static float spentMs     = 0.F;
+    const auto   T0          = std::chrono::steady_clock::now();
+    if (T0 - windowStart > std::chrono::milliseconds(16)) {
+        windowStart = T0;
+        spentMs     = 0.F;
+    }
+    if (budgeted && spentMs > 6.F)
+        return nullptr;
+
+    SP<Render::ITexture> texture;
+    Hyprgraphics::CImage image(path, {sc<double>(px), sc<double>(px)});
+    if (image.success()) {
+        if (const auto SURFACE = image.cairoSurface(); SURFACE && SURFACE->cairo()) {
+            // A raster ignores the size it is asked for: resample it to fit
+            // `px` (IconSize.hpp), so GL_LINEAR is not left minifying it.
+            cairo_surface_flush(SURFACE->cairo());
+            auto* const SMALL = IconSize::downscale(SURFACE->cairo(), px);
+            auto        freeSmall = Hyprutils::Utils::CScopeGuard([SMALL] {
+                if (SMALL)
+                    cairo_surface_destroy(SMALL);
+            });
+            auto* const CAIRO = SMALL ? SMALL : SURFACE->cairo();
+            cairo_surface_flush(CAIRO);
+            auto* const    DATA   = cairo_image_surface_get_data(CAIRO);
+            const int      W      = cairo_image_surface_get_width(CAIRO);
+            const int      H      = cairo_image_surface_get_height(CAIRO);
+            const int      STRIDE = cairo_image_surface_get_stride(CAIRO);
+            const uint32_t FORMAT = cairo_image_surface_get_format(CAIRO) == CAIRO_FORMAT_RGB24 ? DRM_FORMAT_XRGB8888 : DRM_FORMAT_ARGB8888;
+            if (DATA && W > 0 && H > 0)
+                texture = padded ? uploadPadded(DATA, W, H, STRIDE, FORMAT) :
+                                   makeShared<Render::GL::CGLTexture>(FORMAT, DATA, sc<uint32_t>(STRIDE), Vector2D{sc<double>(W), sc<double>(H)});
+        }
+    }
+    spentMs += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - T0).count();
+    g_imageFiles[KEY] = texture;
+    return texture;
+}
+
+// Dock stacks C: hyprdrive's own artwork (BuiltinIcons), rasterised from the
+// embedded SVG at `px`. Keyed on the accent as well, which the empty stack is
+// drawn in, so a theme change redraws it.
+static std::unordered_map<std::string, SP<Render::ITexture>> g_builtinIcons;
+
+static SP<Render::ITexture> builtinIcon(const std::string& name, int px) {
+    const auto A   = Hyprdrive::Config::highlightColor();
+    const auto HEX = std::format("#{:02x}{:02x}{:02x}", sc<int>(std::clamp(A.r, 0.0, 1.0) * 255.0), sc<int>(std::clamp(A.g, 0.0, 1.0) * 255.0),
+                                 sc<int>(std::clamp(A.b, 0.0, 1.0) * 255.0));
+    const auto KEY = name + "\x01" + std::to_string(px) + "\x01" + HEX;
+    if (const auto IT = g_builtinIcons.find(KEY); IT != g_builtinIcons.end())
+        return IT->second;
+    if (g_builtinIcons.size() > 64)
+        g_builtinIcons.clear();
+
+    SP<Render::ITexture> texture;
+    const auto           SVG = Hyprdrive::BuiltinIcons::svg(name, HEX);
+    if (!SVG.empty()) {
+        Hyprgraphics::CImage image(std::span<const uint8_t>{reinterpret_cast<const uint8_t*>(SVG.data()), SVG.size()}, Hyprgraphics::IMAGE_FORMAT_SVG,
+                                   {sc<double>(px), sc<double>(px)});
+        if (image.success()) {
+            if (const auto SURFACE = image.cairoSurface(); SURFACE && SURFACE->cairo()) {
+                auto* const CAIRO = SURFACE->cairo();
+                cairo_surface_flush(CAIRO);
+                auto* const    DATA   = cairo_image_surface_get_data(CAIRO);
+                const int      W      = cairo_image_surface_get_width(CAIRO);
+                const int      H      = cairo_image_surface_get_height(CAIRO);
+                const int      STRIDE = cairo_image_surface_get_stride(CAIRO);
+                const uint32_t FORMAT = cairo_image_surface_get_format(CAIRO) == CAIRO_FORMAT_RGB24 ? DRM_FORMAT_XRGB8888 : DRM_FORMAT_ARGB8888;
+                if (DATA && W > 0 && H > 0)
+                    texture = makeShared<Render::GL::CGLTexture>(FORMAT, DATA, sc<uint32_t>(STRIDE), Vector2D{sc<double>(W), sc<double>(H)});
+            }
+        }
+    }
+    g_builtinIcons[KEY] = texture;
+    return texture;
+}
+
+static std::unordered_map<std::string, SP<Render::ITexture>> g_roundedRects;
+
+SP<Render::ITexture> roundedRect(int w, int h, int radius, const CHyprColor& color, const CHyprColor& border, int borderPx) {
+    if (w < 2 || h < 2)
+        return nullptr;
+    const auto KEY = std::format("{}x{}r{}#{:.3f},{:.3f},{:.3f},{:.3f}b{}#{:.3f},{:.3f},{:.3f},{:.3f}", w, h, radius, color.r, color.g, color.b, color.a, borderPx, border.r, border.g,
+                                 border.b, border.a);
+    if (const auto IT = g_roundedRects.find(KEY); IT != g_roundedRects.end())
+        return IT->second;
+    if (g_roundedRects.size() > 128)
+        g_roundedRects.clear();
+
+    // PADDED (see appIcon): the shape sits inside a TEX_PAD clear border.
+    auto* const SURF = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w + 2 * TEX_PAD, h + 2 * TEX_PAD);
+    auto* const CR   = cairo_create(SURF);
+    cairo_translate(CR, TEX_PAD, TEX_PAD);
+    const double R   = std::clamp<double>(radius, 0.0, std::min(w, h) / 2.0);
+    cairo_new_sub_path(CR);
+    cairo_arc(CR, w - R, R, R, -M_PI / 2, 0);
+    cairo_arc(CR, w - R, h - R, R, 0, M_PI / 2);
+    cairo_arc(CR, R, h - R, R, M_PI / 2, M_PI);
+    cairo_arc(CR, R, R, R, M_PI, 3 * M_PI / 2);
+    cairo_close_path(CR);
+    cairo_set_source_rgba(CR, color.r, color.g, color.b, color.a);
+    if (borderPx > 0 && border.a > 0.0) {
+        cairo_fill_preserve(CR);
+        // Stroked on the inside of the edge (clip to the shape, double width),
+        // so the outline never grows the texture past w x h.
+        cairo_save(CR);
+        cairo_clip_preserve(CR);
+        cairo_set_line_width(CR, borderPx * 2.0);
+        cairo_set_source_rgba(CR, border.r, border.g, border.b, border.a);
+        cairo_stroke(CR);
+        cairo_restore(CR);
+    } else
+        cairo_fill(CR);
+    cairo_surface_flush(SURF);
+    SP<Render::ITexture> texture = makeShared<Render::GL::CGLTexture>(DRM_FORMAT_ARGB8888, cairo_image_surface_get_data(SURF), sc<uint32_t>(cairo_image_surface_get_stride(SURF)),
+                                                                      Vector2D{sc<double>(w + 2 * TEX_PAD), sc<double>(h + 2 * TEX_PAD)});
+    cairo_destroy(CR);
+    cairo_surface_destroy(SURF);
+    g_roundedRects[KEY] = texture;
+    return texture;
+}
+
+namespace {
+    wl_event_source*         g_warmTimer = nullptr;
+    struct SWarmIcon {
+        std::string name;
+        double      px = 0.0; // the draw size it is warmed for; 0 = unsized
+    };
+    std::vector<SWarmIcon>   g_warmQueue;
+    uint64_t                 g_warmInvGen = 0;
+    constexpr int            WARM_TICK_MS = 25;
+
+    // The rows a first letter can bring up besides apps: the Omarchy menu's
+    // matches for each letter, and the "Ask <agent>" rows. Gathered once per
+    // refill (the menu search is an in-memory scan).
+    // Cached per inventory generation: the 3 s recheck would otherwise run the
+    // 26 menu searches every time (~2.5 ms).
+    const std::vector<SearchBackend::SSearchItem>& warmSearchItems() {
+        static std::vector<SearchBackend::SSearchItem> items;
+        static uint64_t                                 builtFor = 0;
+        if (const auto GEN = AppSearch::inventoryGeneration(); GEN != builtFor || items.empty()) {
+            builtFor = GEN;
+            items    = SearchBackend::promptAllAgents("x");
+            for (char c = 'a'; c <= 'z'; ++c) {
+                auto menu = SearchBackend::searchMenu(std::string(1, c));
+                items.insert(items.end(), std::make_move_iterator(menu.begin()), std::make_move_iterator(menu.end()));
+            }
+        }
+        return items;
+    }
+
+    void refillWarmQueue() {
+        g_warmQueue.clear();
+        std::unordered_set<std::string> seen;
+        const auto push = [&](const std::string& name, double px = 0.0) {
+            if (!name.empty() && seen.insert(appIconKey(name, IconSize::bucket(px))).second)
+                g_warmQueue.push_back({name, px});
+        };
+        // Popped from the back: push in REVERSE priority.
+        for (const auto& E : AppSearch::inventory())
+            push(E.icon);
+        for (const auto& I : warmSearchItems())
+            if (!SearchBackend::isGlyphIcon(I.icon))
+                push(I.icon);
+        for (const char* SECTION : {"utilities-terminal", "folder", "system-run"}) // overviewSearchSections
+            push(SECTION);
+        for (const char* TOOL : {"preferences-desktop-locale", "accessories-dictionary"}) // the Define / Translate rows
+            push(TOOL);
+        push("window-close-symbolic");
+        for (const auto& W : Desktop::windowState()->windows())
+            if (W && W->mapped())
+                push(AppSearch::iconForClass(Hyprdrive::AppIdentity::groupKey(W)));
+    }
+
+    // THE FIRST KEYSTROKE'S LABELS. Once the icons are in, the same timer
+    // rasterises what the first letter typed will show: each app's row name,
+    // the typed letter itself, and the placeholder -- in the sizes the search
+    // draws them at on each monitor at rest (search scale = monitor scale x
+    // plugin:hyprdrive:scale). A few per tick; a miss here only means that
+    // label is drawn cold as before.
+    struct SWarmText {
+        std::string str;
+        CHyprColor  color;
+        int         px     = 0;
+        int         weight = 0;
+    };
+    std::vector<SWarmText> g_warmTexts;
+    std::string            g_warmTextsFor; // what g_warmTexts was built for
+    constexpr int          WARM_TEXTS_PER_TICK = 6;
+
+    std::string warmTextsKey() {
+        std::string key = std::format("{}|{}|{:x}|{:x}|{}", AppSearch::inventoryGeneration(), Hyprdrive::Config::themeFontFamily(),
+                                      Hyprdrive::Config::themeForeground().getAsHex(), Hyprdrive::Config::themeMutedText().getAsHex(), Hyprdrive::Config::getScale());
+        for (const auto& M : State::monitorState()->monitors())
+            if (M)
+                key += std::format("|{}", M->m_scale);
+        key += "|" + SearchBackend::menuRootTitle(); // column 0's heading follows Integration
+        return key;
+    }
+
+    void refillWarmTexts() {
+        g_warmTexts.clear();
+        std::unordered_set<float> scales;
+        for (const auto& M : State::monitorState()->monitors())
+            if (M)
+                scales.insert(sc<float>(M->m_scale) * Hyprdrive::Config::getScale());
+        const auto FG    = Hyprdrive::Config::themeForeground();
+        const auto MUTED = Hyprdrive::Config::themeMutedText();
+        const auto px    = [](float base, float scale) { return std::max(1, sc<int>(std::round(base * scale))); };
+        // Popped from the back: push in REVERSE priority.
+        const auto HEADING = Hyprdrive::Config::themeHeading();
+        const auto& ITEMS  = warmSearchItems();
+        for (const float S : scales) {
+            for (const auto& E : AppSearch::inventory())
+                g_warmTexts.push_back({E.name, FG, px(13.F, S), 500}); // drawSearch's card rows
+            for (const auto& I : ITEMS)
+                g_warmTexts.push_back({I.name, FG, px(13.F, S), 500});
+            for (const char* TOOL : {"Translate", "Define"})
+                g_warmTexts.push_back({TOOL, FG, px(13.F, S), 500});
+            for (int n = 30; n >= 1; --n)
+                g_warmTexts.push_back({"+" + std::to_string(n), MUTED, px(11.F, S), 500}); // a card's "+N more"
+            for (const std::string& TITLE : {std::string{"Files & Folders"}, std::string{"AI & Tools"}, SearchBackend::menuRootTitle()})
+                g_warmTexts.push_back({TITLE, HEADING, px(12.F, S), 600}); // the card headings
+        }
+        for (const float S : scales) {
+            for (char c = '9'; c >= '0'; --c)
+                g_warmTexts.push_back({std::string(1, c), FG, px(OVERVIEW_PILL_TEXTPX, S), 600});
+            for (char c = 'z'; c >= 'a'; --c)
+                g_warmTexts.push_back({std::string(1, c), FG, px(OVERVIEW_PILL_TEXTPX, S), 600}); // the typed query
+            g_warmTexts.push_back({"Search, calculate or run", MUTED, px(OVERVIEW_PILL_TEXTPX, S), 0});
+        }
+    }
+
+    int warmTick(void*) {
+        // Never while an overview is up: that is the moment being protected.
+        if (!scrollOverviews().empty()) {
+            wl_event_source_timer_update(g_warmTimer, 500);
+            return 0;
+        }
+        if (const auto GEN = AppSearch::inventoryGeneration(); GEN != g_warmInvGen) {
+            g_warmInvGen = GEN;
+            refillWarmQueue();
+        }
+        while (!g_warmQueue.empty() && appIconWarm(g_warmQueue.back().name, g_warmQueue.back().px))
+            g_warmQueue.pop_back();
+        if (g_warmQueue.empty()) {
+            if (const auto KEY = warmTextsKey(); KEY != g_warmTextsFor) {
+                g_warmTextsFor = KEY;
+                refillWarmTexts();
+            }
+            if (!g_warmTexts.empty()) {
+                if (Render::GL::g_pHyprOpenGL)
+                    Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+                for (int i = 0; i < WARM_TEXTS_PER_TICK && !g_warmTexts.empty(); ++i) {
+                    const auto& T = g_warmTexts.back();
+                    text(T.str, T.color, T.px, false, "", 0, T.weight);
+                    g_warmTexts.pop_back();
+                }
+                wl_event_source_timer_update(g_warmTimer, WARM_TICK_MS);
+                return 0;
+            }
+            // Everything warm: look again now and then (new windows, a theme
+            // change that cleared the cache).
+            wl_event_source_timer_update(g_warmTimer, 3000);
+            g_warmInvGen = 0;
+            return 0;
+        }
+        if (Render::GL::g_pHyprOpenGL)
+            Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+        appIcon(g_warmQueue.back().name, false, false, g_warmQueue.back().px);
+        g_warmQueue.pop_back();
+        wl_event_source_timer_update(g_warmTimer, WARM_TICK_MS);
+        return 0;
+    }
+}
+
+void startIconWarmer() {
+    if (g_warmTimer || !g_pCompositor)
+        return;
+    g_warmTimer = wl_event_loop_add_timer(g_pCompositor->m_wlEventLoop, warmTick, nullptr);
+    if (g_warmTimer)
+        wl_event_source_timer_update(g_warmTimer, 1500); // let the load settle first
+}
+
+void stopIconWarmer() {
+    if (g_warmTimer)
+        wl_event_source_remove(g_warmTimer);
+    g_warmTimer = nullptr;
+    g_warmQueue.clear();
+    g_warmTexts.clear();
+    g_warmTextsFor.clear();
+}
+
+// Drop the least recently drawn SIZED textures of `base` past
+// APP_ICON_SIZES_KEPT. The unsized one (the overview's) is never dropped here.
+static void evictAppIconSizes(const std::string& base) {
+    std::vector<decltype(g_overviewAppIcons)::iterator> sized;
+    for (auto it = g_overviewAppIcons.begin(); it != g_overviewAppIcons.end(); ++it)
+        if (it->second.bucket > 0 && it->second.base == base)
+            sized.push_back(it);
+    if (sized.size() <= APP_ICON_SIZES_KEPT)
+        return;
+    std::ranges::sort(sized, [](const auto& a, const auto& b) { return a->second.lastUse < b->second.lastUse; });
+    for (size_t i = 0; i < sized.size() - APP_ICON_SIZES_KEPT; ++i)
+        g_overviewAppIcons.erase(sized[i]);
+}
+
+// A NEW SIZE of an icon that is already held at another one -- a dock size
+// slider being dragged, a pill re-fitting to one more app -- would otherwise
+// decode every icon of the dock inside one frame, per pixel of the drag. So
+// those decodes get ~4 ms per ~16 ms; past that the nearest size held is drawn
+// for now and appIconsPending() asks the dock for another frame. A size with
+// nothing to stand in for it is always decoded at once: nothing ever blinks out.
+static constexpr float APP_ICON_RESIZE_BUDGET_MS = 4.F;
+static auto            g_resizeWindowStart       = std::chrono::steady_clock::now();
+static float           g_resizeSpentMs           = 0.F;
+static bool            g_appIconsPending         = false;
+
+bool takeAppIconsPending() {
+    return std::exchange(g_appIconsPending, false);
+}
+
+static SP<Render::ITexture> nearestHeldSize(const std::string& base, int bucket) {
+    SP<Render::ITexture> best;
+    int                  bestDist = 0;
+    for (const auto& [K, E] : g_overviewAppIcons)
+        if (E.bucket > 0 && E.base == base && E.texture && E.texture->ok() && (!best || std::abs(E.bucket - bucket) < bestDist)) {
+            best     = E.texture;
+            bestDist = std::abs(E.bucket - bucket);
+        }
+    return best;
+}
+
+SP<Render::ITexture> appIcon(const std::string& iconName, bool tintWhite, bool padded, double px) {
+    if (iconName.empty())
+        return nullptr;
+    const int BUCKET = IconSize::bucket(px);
+    if (iconName.starts_with(Hyprdrive::BuiltinIcons::PREFIX))
+        return builtinIcon(iconName, BUCKET > 0 ? BUCKET : 192);
+
+    const std::string BASE = appIconBaseKey(iconName, tintWhite, padded);
+    const std::string KEY  = appIconKey(BASE, BUCKET);
+
+    // What a NAME resolves to changes when the icon index is rebuilt (an icon
+    // installed after the first lookup). See SAppIcon: re-resolve, and keep
+    // the texture when the file is the same.
+    const auto GEN = AppSearch::iconIndexGeneration();
+    if (const auto IT = g_overviewAppIcons.find(KEY); IT != g_overviewAppIcons.end()) {
+        IT->second.lastUse = ++g_appIconUse;
+        if (IT->second.gen == GEN)
+            return IT->second.texture;
+        if (resolveAppIconPath(iconName) == IT->second.path) {
+            IT->second.gen = GEN;
+            return IT->second.texture;
+        }
+    }
+
+    if (BUCKET > 0) {
+        if (const auto NOW = std::chrono::steady_clock::now(); NOW - g_resizeWindowStart > std::chrono::milliseconds(16)) {
+            g_resizeWindowStart = NOW;
+            g_resizeSpentMs     = 0.F;
+        }
+        if (g_resizeSpentMs > APP_ICON_RESIZE_BUDGET_MS)
+            if (auto standIn = nearestHeldSize(BASE, BUCKET)) {
+                g_appIconsPending = true;
+                return standIn;
+            }
+    }
+
+    SP<Render::ITexture> texture;
+
+    // X52 profile: split the COLD path three ways -- the icon-theme filesystem
+    // walk, the decode/rasterise, and the texture upload -- because the fix for
+    // each is a different fix.
+    ++Prof::icoCold;
+    const auto T0  = Prof::clock::now();
+    auto       UP0 = T0;
+
+    // "@<theme>:<name>": that icon from another theme (dock stacks, 2026-09-24:
+    // the stacks and the Trash follow the Omarchy theme's icons, or GTK's).
+    // Never decoded before its size is known: an icon the size of a wall
+    // would be decoded whole, on this thread (ImageGuard.hpp). Refused, it
+    // draws as the generic tile below.
+    std::string resolved = resolveAppIconPath(iconName);
+    if (!resolved.empty() && !Hyprdrive::ImageGuard::decodable(resolved)) {
+        resolved = AppSearch::resolveIconPath("application-x-executable"); // AppSearch's generic tile
+        if (!resolved.empty() && !Hyprdrive::ImageGuard::decodable(resolved))
+            resolved.clear();
+    }
+    if (const auto& PATH = resolved; !PATH.empty()) {
+        const auto T1 = Prof::clock::now();
+        Prof::icoResolveNs += std::chrono::duration_cast<std::chrono::nanoseconds>(T1 - T0).count();
+
+        // An SVG rasterises at the size asked; a raster (a Flatpak's 256 px
+        // PNG, say) ignores it and is resampled below.
+        const double         DECODEPX = BUCKET > 0 ? BUCKET : OVERVIEW_APP_ICON_PX;
+        Hyprgraphics::CImage image(PATH, {DECODEPX, DECODEPX});
+        if (image.success() && BUCKET > 0)
+            if (const auto SURFACE = image.cairoSurface(); SURFACE && SURFACE->cairo())
+                cairo_surface_flush(SURFACE->cairo());
+        // Sized: a raster bigger than the draw is resampled to it with a real
+        // filter (IconSize.hpp) -- drawn as it is, GL_LINEAR minified a 256 px
+        // PNG ~4.7x into a 54 px dock cell and stair-stepped every edge.
+        cairo_surface_t* const SMALL     = image.success() && BUCKET > 0 && image.cairoSurface() ? IconSize::downscale(image.cairoSurface()->cairo(), BUCKET) : nullptr;
+        auto                   freeSmall = Hyprutils::Utils::CScopeGuard([SMALL] {
+            if (SMALL)
+                cairo_surface_destroy(SMALL);
+        });
+        const auto T2 = Prof::clock::now();
+        Prof::icoDecodeNs += std::chrono::duration_cast<std::chrono::nanoseconds>(T2 - T1).count();
+        UP0 = T2;
+        if (image.success()) {
+            if (const auto SURFACE = image.cairoSurface(); SURFACE && SURFACE->cairo()) {
+                auto* const CAIRO = SMALL ? SMALL : SURFACE->cairo();
+                cairo_surface_flush(CAIRO);
+
+                auto* const   DATA   = cairo_image_surface_get_data(CAIRO);
+                const int     W      = cairo_image_surface_get_width(CAIRO);
+                const int     H      = cairo_image_surface_get_height(CAIRO);
+                const int     STRIDE = cairo_image_surface_get_stride(CAIRO);
+                // cairo hands back premultiplied BGRA on little-endian, which is
+                // what ARGB8888 means to DRM. RGB24 surfaces carry no alpha.
+                const uint32_t FORMAT = cairo_image_surface_get_format(CAIRO) == CAIRO_FORMAT_RGB24 ? DRM_FORMAT_XRGB8888 : DRM_FORMAT_ARGB8888;
+
+                // White, but only where the artwork already is: the buffer is
+                // PREMULTIPLIED, so white at alpha a is exactly (a, a, a, a).
+                // Writing the alpha into all three channels recolours the glyph
+                // and leaves its antialiased edges intact.
+                //
+                // Skipped for RGB24, which carries no alpha -- there is no shape
+                // to preserve there, and tinting it would just paint a white
+                // rectangle.
+                if (DATA && tintWhite && FORMAT == DRM_FORMAT_ARGB8888) {
+                    for (int y = 0; y < H; ++y) {
+                        auto* const ROW = DATA + (sc<size_t>(y) * sc<size_t>(STRIDE));
+                        for (int x = 0; x < W; ++x) {
+                            auto* const PX = ROW + (sc<size_t>(x) * 4);
+                            PX[0] = PX[1] = PX[2] = PX[3]; // B = G = R = A
+                        }
+                    }
+                }
+
+                if (DATA && W > 0 && H > 0)
+                    texture = padded ? uploadPadded(DATA, W, H, STRIDE, FORMAT) :
+                                       makeShared<Render::GL::CGLTexture>(FORMAT, DATA, sc<uint32_t>(STRIDE), Vector2D{sc<double>(W), sc<double>(H)});
+            }
+        }
+    }
+
+    Prof::icoUploadNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Prof::clock::now() - UP0).count();
+
+    g_overviewAppIcons[KEY] = SAppIcon{.texture = texture, .path = resolved, .gen = GEN, .base = BASE, .bucket = BUCKET, .lastUse = ++g_appIconUse};
+    if (BUCKET > 0) {
+        evictAppIconSizes(BASE);
+        g_resizeSpentMs += std::chrono::duration<float, std::milli>(Prof::clock::now() - T0).count();
+    }
+    return texture;
+}
+
+
+// Everything renderText() varies its output on. Colour is in here because the
+// same label is drawn selected and unselected, and those are different pixels.
+struct STextKey {
+    std::string str;
+    std::string fontFamily;
+    uint32_t    color  = 0;
+    int         fontSize = 0;
+    int         maxWidth = 0;
+    int         maxHeight = 0;
+    int         weight   = 0;
+    bool        italic   = false;
+    bool        wrap     = false;
+
+    bool        operator==(const STextKey&) const = default;
+};
+
+// The same key, OWNING NOTHING. text() is called a few hundred times a frame and
+// nearly every one of those is a cache HIT; building the owning STextKey first
+// copied the string AND the family on every one of them -- two heap allocations
+// to look something up. C++20 heterogeneous lookup hashes the views where they
+// lie, so only a genuine insert allocates.
+//
+// std::hash<std::string_view> and std::hash<std::string> are REQUIRED to agree
+// on the same characters, so the view and the owning key land in one bucket.
+struct STextKeyView {
+    std::string_view str;
+    std::string_view fontFamily;
+    uint32_t         color  = 0;
+    int              fontSize = 0;
+    int              maxWidth = 0;
+    int              maxHeight = 0;
+    int              weight   = 0;
+    bool             italic   = false;
+    bool             wrap     = false;
+};
+
+static STextKeyView viewOf(const STextKey& k) {
+    return {k.str, k.fontFamily, k.color, k.fontSize, k.maxWidth, k.maxHeight, k.weight, k.italic, k.wrap};
+}
+
+struct STextKeyHash {
+    using is_transparent = void;
+
+    size_t operator()(const STextKeyView& k) const {
+        size_t h = std::hash<std::string_view>{}(k.str);
+        for (const size_t PART : {std::hash<std::string_view>{}(k.fontFamily), sc<size_t>(k.color), sc<size_t>(k.fontSize), sc<size_t>(k.maxWidth), sc<size_t>(k.maxHeight),
+                                  sc<size_t>(k.weight), sc<size_t>(k.italic), sc<size_t>(k.wrap)})
+            h ^= PART + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+
+    size_t operator()(const STextKey& k) const {
+        return (*this)(viewOf(k));
+    }
+};
+
+struct STextKeyEqual {
+    using is_transparent = void;
+
+    bool operator()(const STextKeyView& a, const STextKeyView& b) const {
+        return a.str == b.str && a.fontFamily == b.fontFamily && a.color == b.color && a.fontSize == b.fontSize && a.maxWidth == b.maxWidth && a.maxHeight == b.maxHeight &&
+            a.weight == b.weight && a.italic == b.italic && a.wrap == b.wrap;
+    }
+
+    bool operator()(const STextKey& a, const STextKey& b) const {
+        return a == b;
+    }
+    bool operator()(const STextKey& a, const STextKeyView& b) const {
+        return (*this)(viewOf(a), b);
+    }
+    bool operator()(const STextKeyView& a, const STextKey& b) const {
+        return (*this)(a, viewOf(b));
+    }
+};
+
+static std::unordered_map<STextKey, SP<Render::ITexture>, STextKeyHash, STextKeyEqual> g_textCache;
+// The generation before g_textCache. See text().
+static std::unordered_map<STextKey, SP<Render::ITexture>, STextKeyHash, STextKeyEqual> g_textCacheOld;
+
+// A clock counts up, a search box fills a character at a time, a badge counts
+// windows: the strings asked for are open-ended, so the cache needs a ceiling.
+//
+// TWO GENERATIONS, not a wholesale clear. The clear was one branch and "cheap to
+// rebuild" -- until every result row carries the query ("Ask Grok: typing a
+// longer sentence...") and every monitor renders its own set: a long sentence
+// typed and erased walks straight through 1024 entries, and the clear then threw
+// out every texture on screen at once, so the next frame re-rasterised all of
+// them together -- a hitch that landed mid-erase (user, 2026-09-14). Now a full
+// cache becomes the OLD generation and a hit there is promoted back, so what is
+// still being drawn survives and only strings nobody has asked for in a whole
+// generation are dropped.
+static constexpr size_t TEXT_CACHE_MAX = 1024;
+
+// The logical width renderText gives `str` with no limit, measured once (a
+// Pango layout, no raster). Colour and maxWidth are left 0 in the key.
+static std::unordered_map<STextKey, int, STextKeyHash, STextKeyEqual> g_textWidths;
+
+static int naturalTextWidth(const std::string& str, const std::string& family, int fontSize, int weight, bool italic) {
+    const STextKeyView KEY{.str = str, .fontFamily = family, .color = 0, .fontSize = fontSize, .maxWidth = 0, .weight = weight, .italic = italic};
+    if (const auto IT = g_textWidths.find(KEY); IT != g_textWidths.end())
+        return IT->second;
+    if (g_textWidths.size() >= 4 * TEXT_CACHE_MAX)
+        g_textWidths.clear();
+
+    PangoFontMap*         fontMap = pango_cairo_font_map_get_default();
+    PangoContext*         context = pango_font_map_create_context(fontMap);
+    PangoLayout*          layout  = pango_layout_new(context);
+    PangoFontDescription* fd      = pango_font_description_new();
+    pango_font_description_set_family(fd, family.c_str());
+    pango_font_description_set_absolute_size(fd, fontSize * PANGO_SCALE);
+    pango_font_description_set_style(fd, italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
+    pango_font_description_set_weight(fd, sc<PangoWeight>(weight));
+    pango_layout_set_font_description(layout, fd);
+    pango_layout_set_text(layout, str.c_str(), -1);
+    PangoRectangle ink = {}, logical = {};
+    pango_layout_get_pixel_extents(layout, &ink, &logical);
+    pango_font_description_free(fd);
+    g_object_unref(layout);
+    g_object_unref(context);
+
+    // +1: Pango compares in its own sub-pixel units, so a label exactly as
+    // wide as the limit keeps its maxWidth key. That is only a missed share,
+    // never wrong pixels.
+    const int W = logical.width + 1;
+    g_textWidths.emplace(STextKey{.str = str, .fontFamily = family, .color = 0, .fontSize = fontSize, .maxWidth = 0, .weight = weight, .italic = italic}, W);
+    return W;
+}
+
+static SP<Render::ITexture> textImpl(const std::string& str, const CHyprColor& color, int fontSize, bool italic, const std::string& fontFamily, int maxWidth, int weight) {
+    if (str.empty())
+        return nullptr;
+
+    // Empty family used to rasterise Hyprland's default Sans. Omarchy's font
+    // lives on the fontconfig monospace alias (`omarchy font set`); callers
+    // that do not pin a family inherit that. Bound by REFERENCE: themeFontFamily
+    // hands back its cache, and this runs on every probe.
+    const std::string& FAMILY = fontFamily.empty() ? Hyprdrive::Config::themeFontFamily() : fontFamily;
+    // A label that FITS is the same pixels at any maxWidth (renderText sizes
+    // the texture to the text, ellipsising only past the limit), so maxWidth
+    // leaves the key unless it actually cuts the label. Callers pass the
+    // width of a pane or card that is still growing -- the results pane opening
+    // on the first keystroke handed every row a new width every frame, and all
+    // ~50 visible labels re-rasterised each frame of the animation (~5-10 ms a
+    // frame), enough to push Hyprland to half rate for the rest of it.
+    if (maxWidth > 0 && naturalTextWidth(str, FAMILY, fontSize, weight, italic) <= maxWidth)
+        maxWidth = 0;
+
+    const STextKeyView KEY{.str        = str,
+                           .fontFamily = FAMILY,
+                           .color      = color.getAsHex(),
+                           .fontSize   = fontSize,
+                           .maxWidth   = maxWidth,
+                           .weight     = weight,
+                           .italic     = italic};
+
+    if (const auto IT = g_textCache.find(KEY); IT != g_textCache.end())
+        return IT->second;
+
+    if (g_textCache.size() >= TEXT_CACHE_MAX) {
+        g_textCacheOld = std::move(g_textCache);
+        g_textCache.clear();
+    }
+
+    // Past here the key is being STORED, so this is where it is allowed to own
+    // its strings -- the two generations keep working on owning keys exactly as
+    // before, and a promotion out of the old generation moves the one it has.
+    if (const auto IT = g_textCacheOld.find(KEY); IT != g_textCacheOld.end()) {
+        auto texture = IT->second;
+        g_textCache.insert(g_textCacheOld.extract(IT));
+        return texture;
+    }
+
+    const auto T0      = Prof::clock::now();
+    auto       texture = g_pHyprRenderer->renderText(str, color, fontSize, italic, FAMILY, maxWidth, weight);
+    Prof::txtNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Prof::clock::now() - T0).count();
+    ++Prof::txtCold;
+    g_textCache.emplace(STextKey{.str        = str,
+                                 .fontFamily = FAMILY,
+                                 .color      = color.getAsHex(),
+                                 .fontSize   = fontSize,
+                                 .maxWidth   = maxWidth,
+                                 .weight     = weight,
+                                 .italic     = italic},
+                        texture);
+    return texture;
+}
+
+// ---- UI GLYPHS WITHOUT TOFU (Glyphs.hpp, Fonts.hpp; native port A15) -------
+//
+// Whether the icon font chosen for plugin:hyprdrive:glyph_font has `cp`. Every
+// Private Use Area codepoint in a label goes through this before pango sees it.
+static bool glyphFontCovers(char32_t cp) {
+    return Hyprdrive::Fonts::iconCovers(Hyprdrive::Config::glyphFontSetting(), cp);
+}
+
+// A family the caller named for a glyph ("JetBrainsMono Nerd Font" from an
+// Omarchy menu entry), checked once: FcFontList per family, then remembered.
+static bool familyInstalled(const std::string& family) {
+    static std::unordered_map<std::string, bool> known;
+    if (const auto IT = known.find(family); IT != known.end())
+        return IT->second;
+    if (known.size() > 64)
+        known.clear();
+    return known.emplace(family, Hyprdrive::Fonts::installed(family)).first->second;
+}
+
+// Text with a PUA codepoint in it is drawn one of two ways, and never as a box:
+//   * every such codepoint is covered by the icon font -> the label as is, with
+//     the icon family appended to the font list ("Noto Sans Mono,Iosevka Nerd
+//     Font"), so pango takes the icon from THAT font rather than from whatever
+//     fallback answers first -- which for U+F001/U+F002 is a ligature table
+//     ("fl"), see Glyphs.hpp;
+//   * otherwise -> Glyphs::substitute: the WGL4 stand-in ("›", "↑", "↕") or
+//     nothing.
+// Labels without one (nearly all of them) pay one byte scan.
+SP<Render::ITexture> text(const std::string& str, const CHyprColor& color, int fontSize, bool italic, const std::string& fontFamily, int maxWidth, int weight) {
+    if (!Hyprdrive::Glyphs::mayContainPrivateUse(str))
+        return textImpl(str, color, fontSize, italic, fontFamily, maxWidth, weight);
+
+    const auto SAFE = Hyprdrive::Glyphs::substitute(str, glyphFontCovers);
+    if (SAFE != str)
+        return SAFE.empty() ? nullptr : textImpl(SAFE, color, fontSize, italic, fontFamily, maxWidth, weight);
+    if (!Hyprdrive::Glyphs::containsPrivateUse(str))
+        return textImpl(str, color, fontSize, italic, fontFamily, maxWidth, weight);
+
+    const auto& ICONFAMILY = Hyprdrive::Fonts::iconFamily(Hyprdrive::Config::glyphFontSetting());
+    const auto& FAMILY     = fontFamily.empty() ? Hyprdrive::Config::themeFontFamily() : fontFamily;
+    if (ICONFAMILY.empty() || FAMILY == ICONFAMILY)
+        return textImpl(str, color, fontSize, italic, fontFamily, maxWidth, weight);
+    return textImpl(str, color, fontSize, italic, FAMILY + "," + ICONFAMILY, maxWidth, weight);
+}
+
+// hyprdrive's own drawing of a glyph (Glyphs::svg), rasterised at px x px in
+// `color` -- the colour's alpha is baked in the way renderText bakes it, so a
+// caller swaps text() for glyph() and nothing else about the draw changes.
+static std::unordered_map<std::string, SP<Render::ITexture>> g_glyphSvgs;
+
+static SP<Render::ITexture> glyphSvg(char32_t cp, const CHyprColor& color, int px) {
+    if (px < 1 || px > 512)
+        return nullptr;
+    const auto HEX = std::format("#{:02x}{:02x}{:02x}", sc<int>(std::clamp(color.r, 0.0, 1.0) * 255.0), sc<int>(std::clamp(color.g, 0.0, 1.0) * 255.0),
+                                 sc<int>(std::clamp(color.b, 0.0, 1.0) * 255.0));
+    const auto KEY = std::format("{:x}\x01{}\x01{}\x01{:.3f}", sc<uint32_t>(cp), px, HEX, color.a);
+    if (const auto IT = g_glyphSvgs.find(KEY); IT != g_glyphSvgs.end())
+        return IT->second;
+    if (g_glyphSvgs.size() > 256)
+        g_glyphSvgs.clear();
+
+    SP<Render::ITexture> texture;
+    const auto           SVG = Hyprdrive::Glyphs::svg(cp, HEX, sc<float>(color.a));
+    if (!SVG.empty()) {
+        Hyprgraphics::CImage image(std::span<const uint8_t>{reinterpret_cast<const uint8_t*>(SVG.data()), SVG.size()}, Hyprgraphics::IMAGE_FORMAT_SVG,
+                                   {sc<double>(px), sc<double>(px)});
+        if (image.success()) {
+            if (const auto SURFACE = image.cairoSurface(); SURFACE && SURFACE->cairo()) {
+                auto* const CAIRO = SURFACE->cairo();
+                cairo_surface_flush(CAIRO);
+                auto* const    DATA   = cairo_image_surface_get_data(CAIRO);
+                const int      W      = cairo_image_surface_get_width(CAIRO);
+                const int      H      = cairo_image_surface_get_height(CAIRO);
+                const int      STRIDE = cairo_image_surface_get_stride(CAIRO);
+                const uint32_t FORMAT = cairo_image_surface_get_format(CAIRO) == CAIRO_FORMAT_RGB24 ? DRM_FORMAT_XRGB8888 : DRM_FORMAT_ARGB8888;
+                if (DATA && W > 0 && H > 0)
+                    texture = makeShared<Render::GL::CGLTexture>(FORMAT, DATA, sc<uint32_t>(STRIDE), Vector2D{sc<double>(W), sc<double>(H)});
+            }
+        }
+    }
+    // A texture that did not come out is remembered as nullptr too: callers
+    // already skip a null/!ok() glyph, and a failed decode must not retry
+    // every frame.
+    g_glyphSvgs[KEY] = texture && texture->ok() ? texture : nullptr;
+    return g_glyphSvgs[KEY];
+}
+
+SP<Render::ITexture> glyph(const std::string& str, const CHyprColor& color, int px, int weight, const std::string& family) {
+    if (str.empty() || px < 1)
+        return nullptr;
+    // Not an icon codepoint at all (an emoji or a letter in a menu file): text.
+    if (!Hyprdrive::Glyphs::containsPrivateUse(str))
+        return text(str, color, px, false, family, 0, weight);
+
+    // Does `covers` have every PUA codepoint of the string?
+    const auto ALLCOVERED = [&](auto&& covers) {
+        for (size_t at = 0; at < str.size();) {
+            const char32_t CP = Hyprdrive::Glyphs::decode(str, at);
+            if (Hyprdrive::Glyphs::isPrivateUse(CP) && !covers(CP))
+                return false;
+        }
+        return true;
+    };
+
+    // 1. The font the caller NAMED (an Omarchy menu entry's own font), by ITS
+    //    coverage. It used to be asked only whether it was installed, while
+    //    coverage was the icon font's: a menu glyph the icon font has and the
+    //    named font lacks was drawn in the named font -- pango then fell back
+    //    to whatever answered first (a box, or the "fl" ligature) -- and one the
+    //    named font has but the icon font lacks never reached it at all.
+    if (!family.empty() && familyInstalled(family) &&
+        ALLCOVERED([&](char32_t cp) { return Hyprdrive::Fonts::familyCovers(family, cp); }))
+        return textImpl(str, color, px, false, family, 0, weight);
+
+    // 2. The icon font chosen for plugin:hyprdrive:glyph_font.
+    if (ALLCOVERED(glyphFontCovers))
+        return textImpl(str, color, px, false, Hyprdrive::Fonts::iconFamily(Hyprdrive::Config::glyphFontSetting()), 0, weight);
+
+    // 3. The builtin SVG, for a single glyph we ship.
+    if (const char32_t CP = Hyprdrive::Glyphs::single(str); CP && Hyprdrive::Glyphs::hasSvg(CP))
+        return glyphSvg(CP, color, px);
+    return nullptr; // a codepoint nobody can draw: no icon, never a box
+}
+
+// A REAL WRAP (user, 2026-09-24: "dictionary could use better wrapping on
+// definitions - we're leaving space on the table"). This used to hand off to
+// text(), i.e. Hyprland's renderText, which sets a width AND
+// PANGO_ELLIPSIZE_END with no height -- one line, cut with an ellipsis. Every
+// "wrapped" caller (the dictionary rows, the inspector's preview and details)
+// was one line however much room it had. Now it is Pango word-wrapping at maxW,
+// as many lines as maxH holds, the ellipsis on the last one that fits.
+namespace {
+    std::unordered_map<std::string, SP<Render::ITexture>> g_wrapCache;
+    constexpr size_t                                      WRAP_CACHE_MAX = 256;
+}
+
+SP<Render::ITexture> textWrapped(const std::string& str, const CHyprColor& color, int fontSize, int maxW, int maxH, bool italic, const std::string& fontFamily, int weight,
+                                 bool centred) {
+    if (str.empty() || maxW < 8 || maxH < 8 || fontSize < 1)
+        return nullptr;
+    // Same rule as text(): no PUA codepoint reaches pango without a font for it.
+    if (Hyprdrive::Glyphs::mayContainPrivateUse(str)) {
+        if (const auto SAFE = Hyprdrive::Glyphs::substitute(str, glyphFontCovers); SAFE != str)
+            return textWrapped(SAFE, color, fontSize, maxW, maxH, italic, fontFamily, weight);
+    }
+
+    const std::string& FAMILY = fontFamily.empty() ? Hyprdrive::Config::themeFontFamily() : fontFamily;
+    const std::string  KEY    = std::format("{}\x1f{}\x1f{:x}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", str, FAMILY, color.getAsHex(), fontSize, maxW, maxH, weight, (italic ? 1 : 0) | (centred ? 2 : 0));
+    if (const auto IT = g_wrapCache.find(KEY); IT != g_wrapCache.end())
+        return IT->second;
+    if (g_wrapCache.size() >= WRAP_CACHE_MAX)
+        g_wrapCache.clear();
+
+    PangoFontMap*         fontMap = pango_cairo_font_map_get_default();
+    PangoContext*         context = pango_font_map_create_context(fontMap);
+    PangoLayout*          layout  = pango_layout_new(context);
+    PangoFontDescription* fd      = pango_font_description_new();
+    pango_font_description_set_family(fd, FAMILY.c_str());
+    pango_font_description_set_absolute_size(fd, fontSize * PANGO_SCALE);
+    pango_font_description_set_style(fd, italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
+    pango_font_description_set_weight(fd, sc<PangoWeight>(weight));
+    pango_layout_set_font_description(layout, fd);
+    pango_layout_set_text(layout, str.c_str(), -1);
+    pango_layout_set_width(layout, maxW * PANGO_SCALE);
+    pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+    pango_layout_set_height(layout, maxH * PANGO_SCALE); // positive: a pixel budget, ellipsis on the last line that fits
+    pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+    if (centred)
+        pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
+
+    PangoRectangle ink, logical;
+    pango_layout_get_pixel_extents(layout, &ink, &logical);
+    const int W = std::clamp(logical.width, 1, maxW);
+    const int H = std::clamp(logical.height, 1, std::max(maxH, fontSize * 2));
+
+    SP<Render::ITexture> texture;
+    cairo_surface_t*     surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
+    if (cairo_surface_status(surface) == CAIRO_STATUS_SUCCESS) {
+        cairo_t* cr = cairo_create(surface);
+        cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+        cairo_paint(cr);
+        cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+        cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
+        cairo_move_to(cr, -logical.x, -logical.y);
+        pango_cairo_show_layout(cr, layout);
+        cairo_surface_flush(surface);
+        texture = g_pHyprRenderer->createTexture(surface);
+        cairo_destroy(cr);
+    }
+    cairo_surface_destroy(surface);
+
+    pango_font_description_free(fd);
+    g_object_unref(layout);
+    g_object_unref(context);
+
+    g_wrapCache.emplace(KEY, texture);
+    return texture;
+}
+
+void clearTextCache() {
+    g_textCache.clear();
+    g_textWidths.clear();
+    g_textCacheOld.clear();
+    g_wrapCache.clear();
+    g_imageFiles.clear();
+    g_builtinIcons.clear();
+    g_glyphSvgs.clear();
+    g_roundedRects.clear();
+}
+
+void flushPass(PHLMONITOR monitor) {
+    auto& ctx = g_pHyprRenderer->context();
+    if (!monitor || ctx.m_pass.empty())
+        return;
+
+    ctx.m_pass.render(ctx, CRegion{CBox{{}, monitor->m_transformedSize}});
+    ctx.m_pass.clear();
+}
+
+void queueBlur(const CBox& box, int rounding, float roundingPower, float alpha, bool usePrecomputedBlur, int blurPasses) {
+    if (alpha <= 0.F)
+        return;
+
+    if (box.empty())
+        return;
+
+    // Same switch window frost and dock frost use. Search/strip chrome used to
+    // queue a live dual-kawase even when decoration:blur:enabled was off, so a
+    // squared Omarchy theme still got a frosted pill.
+    if (!Hyprdrive::Config::getValue<bool>("decoration:blur:enabled"))
+        return;
+
+    // X14: NOT a CRectPassElement. Upstream leaves a blurred rect's corners square
+    // (see COverviewBlurPassElement::draw), so every frosted surface here -- strip
+    // panel, workspace card, search pill -- leaked blur into its corner arcs.
+    COverviewBlurPassElement::SData data;
+    data.box           = box;
+    data.rounding      = rounding;
+    data.roundingPower = roundingPower;
+    data.alpha         = alpha;
+    // usePrecomputedBlur means "sample frameChromeBlur()" (overview), not
+    // Hyprland xray/m_blurFB (desktop wallpaper). See X88.
+    data.xray          = usePrecomputedBlur;
+    // The live fallback's pass count. Callers pass decoration:blur:passes --
+    // Y12 removed X99's -1 -- so it matches the capture (the sample path
+    // ignores this; the capture bakes its own).
+    data.blurPasses    = blurPasses;
+    g_pHyprRenderer->context().m_pass.add(makeUnique<COverviewBlurPassElement>(data));
+}
+
+void themePlate(const CBox& box, int rounding, float roundingPower, float alpha, bool lit, uint64_t fadeKey) {
+    if (box.empty() || alpha <= 0.F)
+        return;
+
+    // A solid plane: Lithic chrome draws no blur (docs/lithic/design.md).
+    const auto PLATE = Hyprdrive::Config::chromePlate();
+    CRectPassElement::SRectData bg;
+    bg.box           = box;
+    bg.color         = PLATE.modifyA(PLATE.a * alpha);
+    bg.round         = rounding;
+    bg.roundingPower = roundingPower;
+    g_pHyprRenderer->context().m_pass.add(makeUnique<CRectPassElement>(bg));
+
+    // Its 1 px hairline at rest (none in the round styles, whose stroke is
+    // clear), the mark of place when the pointer or the keyboard is on it.
+    const auto LIT     = Hyprdrive::Config::highlightColor();
+    const auto RESTING = Hyprdrive::Config::chromeStroke();
+    const auto STROKE  = fadeKey ? Hyprdrive::BorderFade::color(g_pHyprRenderer->context().m_data.pMonitor.lock(), fadeKey, lit, RESTING, LIT) : lit ? LIT : RESTING;
+    if (STROKE.a <= 0.F)
+        return;
+    CBorderPassElement::SBorderData border;
+    border.box = box.copy().round();
+    border.grad1.reset(STROKE);
+    border.a             = alpha;
+    border.borderSize    = 1;
+    border.round         = rounding;
+    border.roundingPower = roundingPower;
+    g_pHyprRenderer->context().m_pass.add(makeUnique<CBorderPassElement>(border));
+}
+
+// The title tag under a card, a strip cell or a Mosaic window: a tooltip in
+// the desktop's style. Lithic cuts it at the tooltip cut and rims it with the
+// vein hairline; the round styles make it a pill with no rim. The plane is the
+// overlay plane and the text the ink, so it reads on a light look as on a dark one.
+namespace {
+    constexpr float PILL_FONT  = 16.F;
+    constexpr float PILL_PAD_X = 16.F;
+    constexpr float PILL_PAD_Y = 9.F;
+}
+
+void ringedPlate(const CBox& plate, int round, float roundingPower, const CHyprColor& ring, double ringPx, const CHyprColor& fill, float alpha) {
+    if (plate.empty() || alpha <= 0.F)
+        return;
+
+    CRectPassElement::SRectData body;
+    body.box           = plate;
+    body.round         = round;
+    body.roundingPower = roundingPower;
+    if (ringPx <= 0.0) {
+        // No ring: the fill over whatever is behind, as it always was.
+        body.color = fill.modifyA(fill.a * alpha);
+        Render::IHyprRenderer::addPassElement(g_pHyprRenderer->context(), makeUnique<CRectPassElement>(body));
+        return;
+    }
+
+    // PlateColor.hpp: the body in the colour it SETTLES at (the fill over the
+    // opaque ring), faded as one -- never the fill over a ring rect under it,
+    // which showed the accent through the body all through every fade.
+    const auto SETTLED = Hyprdrive::PlateColor::settledBody({.r = sc<float>(fill.r), .g = sc<float>(fill.g), .b = sc<float>(fill.b), .a = sc<float>(fill.a)},
+                                                 {.r = sc<float>(ring.r), .g = sc<float>(ring.g), .b = sc<float>(ring.b), .a = 1.F});
+    body.color = CHyprColor{SETTLED.r, SETTLED.g, SETTLED.b, alpha};
+    Render::IHyprRenderer::addPassElement(g_pHyprRenderer->context(), makeUnique<CRectPassElement>(body));
+
+    // The ring only OUTSIDE the plate: the border shader draws `borderSize`
+    // monitor-scaled px around the box with the outer radius round + that --
+    // the geometry the ring rect had.
+    const auto   MON   = g_pHyprRenderer->context().m_data.pMonitor.lock();
+    const double MS    = MON ? std::max(MON->m_scale, 0.01F) : 1.0;
+    CBorderPassElement::SBorderData border;
+    border.box           = plate;
+    border.grad1         = ::Config::CGradientValueData(ring.modifyA(1.F));
+    border.a             = alpha;
+    border.borderSize    = std::max(1, sc<int>(std::round(ringPx / MS)));
+    border.round         = round;
+    border.roundingPower = roundingPower;
+    Render::IHyprRenderer::addPassElement(g_pHyprRenderer->context(), makeUnique<CBorderPassElement>(border));
+}
+
+CBox labelPillBox(PHLMONITOR monitor, const std::string& str, double cx, double bottomY, float scale) {
+    if (str.empty() || !monitor)
+        return {};
+
+    const float SCALE = std::max(scale, 0.01F);
+    const auto  TEX   = text(str, Hyprdrive::Config::themeForeground(), std::max(1, sc<int>(std::round(PILL_FONT * SCALE))), false, "", 0, 500);
+    if (!TEX || !TEX->ok())
+        return {};
+
+    const float PADX = PILL_PAD_X * SCALE;
+    const float PADY = PILL_PAD_Y * SCALE;
+    const float W    = sc<float>(TEX->m_size.x) + 2.F * PADX;
+    const float H    = sc<float>(TEX->m_size.y) + 2.F * PADY;
+
+    CBox plate{std::round(sc<float>(cx) - W / 2.F), std::round(sc<float>(bottomY) - H), std::round(W), std::round(H)};
+    // Keep it on screen: a tile or an icon at either end would otherwise push
+    // its label off the edge.
+    plate.x = std::clamp(plate.x, 0.0, std::max(0.0, monitor->m_size.x * SCALE - plate.width));
+    return plate;
+}
+
+CBox labelPill(PHLMONITOR monitor, const std::string& str, double cx, double bottomY, float alpha, float scale) {
+    if (str.empty() || alpha <= 0.F || !monitor)
+        return {};
+
+    const float SCALE = std::max(scale, 0.01F);
+    const auto  TEX   = text(str, Hyprdrive::Config::themeForeground(), std::max(1, sc<int>(std::round(PILL_FONT * SCALE))), false, "", 0, 500);
+    if (!TEX || !TEX->ok())
+        return {};
+
+    const float PADX  = PILL_PAD_X * SCALE;
+    const float PADY  = PILL_PAD_Y * SCALE;
+    const CBox  plate = labelPillBox(monitor, str, cx, bottomY, scale);
+    if (plate.width < 1)
+        return {};
+
+    const float CORNER = Hyprdrive::Config::chromeCorner(Hyprdrive::Look::current().cuts.tooltip, plate.width / SCALE, plate.height / SCALE);
+    const int   ROUND  = sc<int>(std::round(std::min<double>(CORNER * SCALE, plate.height / 2.0)));
+    const auto  STROKE = Hyprdrive::Config::chromeStroke();
+    ringedPlate(plate, ROUND, Hyprdrive::Config::chromeCornerPower(), STROKE, STROKE.a > 0.F ? sc<double>(SCALE) : 0.0, Hyprdrive::Config::chromeOverlay(), alpha);
+
+    CTexPassElement::SRenderData label;
+    label.tex = TEX;
+    label.box = CBox{std::round(plate.x + PADX), std::round(plate.y + PADY), sc<float>(TEX->m_size.x), sc<float>(TEX->m_size.y)};
+    label.a   = alpha;
+    Render::IHyprRenderer::addPassElement(g_pHyprRenderer->context(), makeUnique<CTexPassElement>(label));
+
+    return plate;
+}
+
+}

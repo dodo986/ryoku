@@ -135,6 +135,7 @@ constexpr uint32_t EVDEV_KEY_LEFTMETA  = 125;
 constexpr uint32_t EVDEV_KEY_RIGHTMETA = 126;
 
 constexpr uint32_t EVDEV_KEY_BACKSPACE = 14;
+constexpr uint32_t EVDEV_KEY_A         = 30;
 
 namespace PluginDetail {
     extern CFunctionHook* g_pScrollRenderWorkspaceHook;
@@ -191,6 +192,8 @@ namespace PluginDetail {
     extern void resetCompose();
     extern void afterQueryEdit();
     extern bool handleSearchPress(uint32_t keycode);
+    // Ctrl+A in the search field: the query goes whole. False when there was none.
+    extern bool clearSearchQuery();
     extern void stopSearchRepeat();
     extern void startSearchRepeat(uint32_t keycode);
     extern int onFileResultsReady(int fd, uint32_t mask, void* data);

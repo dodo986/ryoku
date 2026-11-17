@@ -139,6 +139,14 @@ void                registerRawKeyHooks() {
                     }
                 }
 
+                // Ctrl+A clears the search field, the edit a select-all would lead to
+                if (event.keycode == EVDEV_KEY_A &&
+                    (g_pInputManager->getModsFromAllKBs() & ~(HL_MODIFIER_CAPS | HL_MODIFIER_MOD2)) == HL_MODIFIER_CTRL && clearSearchQuery()) {
+                    g_consumedPresses.insert(event.keycode);
+                    info.cancelled = true;
+                    return;
+                }
+
                 if (handleSearchPress(event.keycode)) {
                     g_consumedPresses.insert(event.keycode);
                     if (event.keycode == EVDEV_KEY_BACKSPACE && !g_search.query.text.empty())

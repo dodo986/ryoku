@@ -178,6 +178,17 @@ void afterQueryEdit() {
     }
 }
 
+bool clearSearchQuery() {
+    if (!overviewAcceptsSearch() || (g_search.query.text.empty() && !g_search.query.active))
+        return false;
+    resetCompose();
+    g_search.query.text.clear();
+    g_search.query.active      = false;
+    g_search.query.windowsOnly = false;
+    afterQueryEdit();
+    return true;
+}
+
 bool handleSearchPress(uint32_t keycode) {
     if (!overviewAcceptsSearch())
         return false;

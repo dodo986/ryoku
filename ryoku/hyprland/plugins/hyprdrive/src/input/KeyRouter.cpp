@@ -49,7 +49,7 @@ namespace PluginDetail {
 void                registerRawKeyHooks() {
     g_pRawKeyHook = Event::bus()->m_events.input.keyboard.key.listen([](IKeyboard::SKeyEvent event, Event::SCallbackInfo& info) {
         const bool PRESSED = event.state == WL_KEYBOARD_KEY_STATE_PRESSED;
-        const bool ISSUPER = event.keycode == EVDEV_KEY_LEFTMETA || event.keycode == EVDEV_KEY_RIGHTMETA;
+        const bool ISSUPER = keyIsSuper(event.keycode);
 
         // The infinite canvas's zoom (Mosaic.hpp) follows every key for its
         // chord (mosaic:zoom_key, any chord): it zooms out the moment the whole
@@ -254,6 +254,10 @@ void                registerRawKeyHooks() {
 
         const auto TIMEOUT = Hyprdrive::Config::getTapSuperTimeoutMs();
         if (TIMEOUT > 0 && event.timeMs - g_tapSuperPressedAt > static_cast<uint32_t>(TIMEOUT))
+            return;
+        // Faster than a hand: a synthetic press/release pair (a remapped Caps
+        // reads as Super, and some setups wrap key events in a CAPSLOCK pair).
+        if (event.timeMs - g_tapSuperPressedAt < 20)
             return;
 
         onOverviewDispatcher("toggle all");

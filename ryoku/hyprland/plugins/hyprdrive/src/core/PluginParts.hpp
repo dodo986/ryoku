@@ -192,6 +192,9 @@ namespace PluginDetail {
     extern void resetCompose();
     extern void afterQueryEdit();
     extern bool handleSearchPress(uint32_t keycode);
+    // Super by the keymap as well as by the board: a key kb_options turns into
+    // Super (caps:super) counts, as Hyprland counts it.
+    extern bool keyIsSuper(uint32_t keycode);
     // Ctrl+A in the search field: the query goes whole. False when there was none.
     extern bool clearSearchQuery();
     extern void stopSearchRepeat();

@@ -23,8 +23,26 @@ bool isGuardModifierKeycode(uint32_t keycode) {
         case 100: // RIGHTALT
         case EVDEV_KEY_LEFTMETA:
         case EVDEV_KEY_RIGHTMETA: return true;
-        default: return false;
+        default: return keyIsSuper(keycode);
     }
+}
+
+bool keyIsSuper(uint32_t keycode) {
+    if (keycode == EVDEV_KEY_LEFTMETA || keycode == EVDEV_KEY_RIGHTMETA)
+        return true;
+    const auto STATE = activeXkbState();
+    if (!STATE)
+        return false;
+    // the key's first level, as the canvas zoom reads it: a held modifier cannot
+    // change what the key is
+    const xkb_keycode_t CODE   = keycode + 8;
+    xkb_keymap* const   KEYMAP = xkb_state_get_keymap(STATE);
+    const xkb_keysym_t* syms   = nullptr;
+    const int           N      = KEYMAP ? xkb_keymap_key_get_syms_by_level(KEYMAP, CODE, xkb_state_key_get_layout(STATE, CODE), 0, &syms) : 0;
+    if (N <= 0)
+        return false;
+    const auto SYM = syms[0];
+    return SYM == XKB_KEY_Super_L || SYM == XKB_KEY_Super_R || SYM == XKB_KEY_Hyper_L || SYM == XKB_KEY_Hyper_R;
 }
 
 // Keys that belong to the whole desktop, never to the search field: PRINT (and

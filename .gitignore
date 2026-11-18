@@ -21,10 +21,6 @@
 /ryoku/apps/ryostore/backend/ryostore
 /ryoku/palette-bridge/ryoku-palette-bridge
 /ryoku/shell/plugin/build/
-/ryoku/hyprland/plugins/hyprdrive/build/
-/ryoku/hyprland/plugins/hyprdrive/hyprdrive.so
-/ryoku/hyprland/plugins/hyprdrive/look/ryoku-hyprdrive-look
-/ryoku/hyprland/plugins/hyprdrive/ryoku-hyprdrive-look
 /ryoku/dictation/build/
 /ryoku/shell/sidebarfx/build/
 /ryoku/shell/ryogami/picker/build/

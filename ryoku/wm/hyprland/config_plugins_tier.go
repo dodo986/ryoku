@@ -24,10 +24,13 @@ import (
 
 // pluginDef is one plugin Ryoku bundles.
 type pluginDef struct {
-	ID            string
-	Name          string
-	Desc          string
-	Repo          string // upstream git URL; "" for a plugin authored in this repo
+	ID   string
+	Name string
+	Desc string
+	Repo string // upstream git URL; "" for a plugin authored in this repo
+	// Branch is the Repo branch Ryoku builds when it is not the repository's
+	// default (Hyprdrive: the fork's ryoku branch); "" builds the default branch.
+	Branch        string
 	Plugin        string // the [table] in the repo's hyprpm.toml
 	Local         string // in-tree source dir for a Ryoku-authored plugin
 	Package       string // the native package that ships the .so
@@ -98,10 +101,10 @@ var bundledPlugins = []pluginDef{
 		// Loaded from its own block in user.lua (hyprdrive.go), never from
 		// settings.lua; its switch and binds are on Windows > Hyprdrive.
 		ID: "hyprdrive", Name: "Hyprdrive",
-		Desc:   "A mission-control overview of every window, Mosaic layouts and window motion.",
-		Plugin: "hyprdrive", Local: "ryoku/hyprland/plugins/hyprdrive",
+		Desc: "A mission-control overview of every window, Mosaic layouts and window motion.",
+		Repo: "https://github.com/dodo986/hyprdrive-ryoku", Branch: "ryoku", Plugin: "hyprdrive",
 		Package: "ryoku-hyprdrive",
-		Docs:    "https://github.com/ryoku-dev/ryoku/blob/unstable-dev/ryoku/hyprland/plugins/hyprdrive/README.md",
+		Docs:    "https://github.com/dodo986/hyprdrive-ryoku/tree/ryoku#readme",
 		Loaded:  "hyprdrive", ConfigSection: "hyprdrive",
 	},
 	{

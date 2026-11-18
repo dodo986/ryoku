@@ -1,17 +1,17 @@
 # Maintainer: Ryoku <releases@ryoku.dev>
 #
 # ryoku-hyprdrive: Hyprdrive, the Hyprland compositor plugin with a
-# mission-control overview, Mosaic layouts and window motion
-# (ryoku/hyprland/plugins/hyprdrive), forked from dragosol/Hyprdrive without its
-# dock. Off until the user turns it on in Ryoku Settings > Windows > Hyprdrive;
-# the provider then writes its block into ~/.config/hypr/user.lua.
+# mission-control overview, Mosaic layouts and window motion, from its own
+# repository (dodo986/hyprdrive-ryoku, the ryoku branch: a fork of
+# dragosol/Hyprdrive without its dock). Off until the user turns it on in Ryoku
+# Settings > Windows > Hyprdrive; the provider then writes its block into
+# ~/.config/hypr/user.lua.
 #
 # Installed as hyprdrive.so under /usr/lib/hyprland/plugins/ with its .abi
 # receipt, agent-run beside it (the search's agent rows), the look bridge
 # ryoku-hyprdrive-look (the desktop's Lithic look, for a plugin that cannot link
-# the library), Lithic's two faces, and the source, so a box without a checkout
-# can rebuild it for a newer Hyprland (`ryoku-hub desktop plugins rebuild
-# hyprdrive`).
+# the library) and Lithic's two faces. A rebuild for a newer Hyprland
+# (`ryoku-hub desktop plugins rebuild hyprdrive`) clones the same branch.
 pkgname=ryoku-hyprdrive
 pkgver=${RYOKU_PKGVER:-0.1.0}
 pkgrel=1
@@ -28,11 +28,12 @@ optdepends=(
   'ffmpeg: the search easter egg plays its video'
   'curl: the search dictionary and translator'
 )
-makedepends=('hyprland' 'pkgconf' 'make' 'gcc' 'go' 'pixman' 'libdrm' 'libinput' 'wayland' 'libxkbcommon' 'lua')
-source=()
+makedepends=('hyprland' 'pkgconf' 'make' 'gcc' 'git' 'go' 'pixman' 'libdrm' 'libinput' 'wayland' 'libxkbcommon' 'lua')
+source=("hyprdrive::git+https://github.com/dodo986/hyprdrive-ryoku.git#branch=ryoku")
+sha256sums=('SKIP')
 
+# Lithic's faces come from this checkout
 _repo="$startdir/../../.."
-_src="$_repo/ryoku/hyprland/plugins/hyprdrive"
 
 # the plugin ABI this build locks to, Hyprland's own client-hash formula:
 # commit + major.minor of aquamarine, hyprutils, hyprgraphics, hyprcursor and
@@ -46,13 +47,23 @@ _abi() {
     "$(v HYPRCURSOR_VERSION)" "$(v HYPRLANG_VERSION)"
 }
 
+prepare() {
+  cd "$srcdir/hyprdrive"
+  local hv commit
+  hv="$(pkg-config --modversion hyprland)"
+  # hyprpm.toml lines: ["<hyprland-commit>", "<plugin-commit>"], # <version>
+  commit="$(grep -F "$hv" hyprpm.toml | grep -oE '[0-9a-f]{40}' | sed -n 2p || true)"
+  if [[ -n "$commit" ]]; then
+    echo "PKGBUILD: $pkgname -> $commit (Hyprland $hv)"
+    git checkout -q "$commit"
+  else
+    # the ryoku branch tracks the Hyprland Ryoku ships and carries no pins
+    echo "PKGBUILD: building $pkgname from the ryoku branch tip"
+  fi
+}
+
 build() {
-  # a copy, so the checkout stays clean
-  rm -rf "$srcdir/hyprdrive"
-  cp -a "$_src" "$srcdir/hyprdrive"
-  rm -rf "$srcdir/hyprdrive/build" "$srcdir/hyprdrive/hyprdrive.so"
-  make -C "$srcdir/hyprdrive" hyprdrive.so
-  (cd "$_src/look" && GOFLAGS=-trimpath go build -o "$srcdir/ryoku-hyprdrive-look" .)
+  make -C "$srcdir/hyprdrive" hyprdrive.so look
 }
 
 check() {
@@ -62,13 +73,9 @@ check() {
 package() {
   install -Dm755 "$srcdir/hyprdrive/hyprdrive.so" "$pkgdir/usr/lib/hyprland/plugins/hyprdrive.so"
   _abi | install -Dm644 /dev/stdin "$pkgdir/usr/lib/hyprland/plugins/hyprdrive.abi"
-  install -Dm755 "$_src/bin/agent-run" "$pkgdir/usr/lib/hyprland/plugins/agent-run"
-  install -Dm755 "$srcdir/ryoku-hyprdrive-look" "$pkgdir/usr/bin/ryoku-hyprdrive-look"
+  install -Dm755 "$srcdir/hyprdrive/bin/agent-run" "$pkgdir/usr/lib/hyprland/plugins/agent-run"
+  install -Dm755 "$srcdir/hyprdrive/ryoku-hyprdrive-look" "$pkgdir/usr/bin/ryoku-hyprdrive-look"
   install -Dm644 -t "$pkgdir/usr/share/ryoku/hyprdrive/fonts" "$_repo"/docs/lithic/library/go/fonts/*.ttf
-  install -Dm644 "$_src/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$srcdir/hyprdrive/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" "$_repo"/docs/lithic/library/go/fonts/*-OFL.txt
-  # the recipe, for a rebuild on a box with no checkout
-  install -d "$pkgdir/usr/share/ryoku/hypr-plugins/hyprdrive"
-  cp -a "$_src/src" "$_src/assets" "$_src/scripts" "$_src/tests" "$_src/Makefile" "$_src/hyprpm.toml" \
-    "$pkgdir/usr/share/ryoku/hypr-plugins/hyprdrive/"
 }

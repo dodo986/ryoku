@@ -155,12 +155,18 @@ then beside its own `.so` (where a local build lays it), then the packaged
 
 ## Hyprdrive
 
-`ryoku/hyprland/plugins/hyprdrive/` is a fork of Hyprdrive (dragosol/Hyprdrive,
-BSD-3-Clause) without its dock, its folder stacks or its Omarchy integration:
-the mission-control overview with its desktop strip and search, Mosaic layouts,
-show desktop and the other window behaviours, and one motion curve with motion
-blur. It is a bundled plugin like the others for building, receipts and the
-doctor, with three differences:
+Hyprdrive lives in its own repository,
+[dodo986/hyprdrive-ryoku](https://github.com/dodo986/hyprdrive-ryoku), on its
+`ryoku` branch: a fork of Hyprdrive (dragosol/Hyprdrive, BSD-3-Clause) without
+its dock, its folder stacks or its Omarchy integration. It brings the
+mission-control overview with its desktop strip and search, Mosaic layouts and
+the infinite canvas, show desktop and the other window behaviours, and one
+motion curve with motion blur. Ryoku keeps only its side here: the provider,
+the settings page and the packages. It is a bundled plugin like the others for
+building, receipts and the doctor, built from that branch rather than the
+repository's default (`Branch` in its entry: the rebuild reads that branch's
+`hyprpm.toml` and builds its tip, and the packages clone it), with three
+differences:
 
 - **It is never loaded from `settings.lua`.** Its load, settings, binds and
   each desktop's layout live in one fenced block at the end of
@@ -174,15 +180,17 @@ doctor, with three differences:
   that would replace one is off until the user turns it on on Windows >
   Hyprdrive; `defaults` hands the Hub that answer for every bind.
 - **It draws in the desktop's style.** The plugin cannot link the Lithic
-  library, so `ryoku-hyprdrive-look --watch` (its `look/` module, on the Lithic
-  Go library) prints the resolved roles, planes and corner rule whenever the
+  library, so `ryoku-hyprdrive-look --watch` (the repository's `look/` module,
+  on a vendored copy of the Lithic Go library) prints the resolved roles, planes and corner rule whenever the
   style or colours change, and the plugin reads them on its event loop
   (`src/platform/Look.hpp`). Its chrome is cut in Lithic and rounded in the
   other styles through the rect shader's corner power (1 cuts, 2 rounds).
 
 The page is Ryoku Settings > Windows > Hyprdrive (`ryoku-shell hub open
 hyprdrive`), shown where the provider reports the `hyprdrive` capability. The
-plugin's own guide is its README.
+plugin's own guide is its README. To work on the plugin, clone that repository
+beside a Ryoku checkout; `make lithic` there refreshes its copy of the Lithic
+library from it.
 
 ## Convergence: the doctor, deploy.sh, the packages
 

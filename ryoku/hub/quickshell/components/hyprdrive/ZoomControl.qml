@@ -73,7 +73,12 @@ Row {
         id: field
         width: 200
         enabled: root.on
-        modifiersAlone: true
+        // modifiers alone (Super+Alt) where the field can record them; an older
+        // Lithic records a chord with a key and still loads
+        Component.onCompleted: {
+            if ("modifiersAlone" in field)
+                field.modifiersAlone = true;
+        }
         accessibleName: I18n.tr("Keys to hold for the canvas zoom")
         placeholder: root.on ? I18n.tr("Not set") : I18n.tr("Turned off")
         chord: Binds.toField(root.current)

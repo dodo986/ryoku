@@ -325,21 +325,34 @@ namespace Hyprdrive::Mosaic {
             return g_chord;
         }
 
+        // What a key is under the keyboard's own layout and options (Caps set to
+        // Super by kb_options is Super_L here), not which key it is on the board.
+        xkb_keysym_t symOf(uint32_t keycode) {
+            const auto KEEB = g_pSeatManager ? g_pSeatManager->m_keyboard.lock() : nullptr;
+            if (!KEEB || !KEEB->m_xkbState)
+                return XKB_KEY_NoSymbol;
+            // the key's first level, so a modifier already held cannot turn it
+            // into another (Shift+Alt reads Meta on many layouts)
+            const xkb_keycode_t CODE   = keycode + 8;
+            xkb_keymap* const   KEYMAP = xkb_state_get_keymap(KEEB->m_xkbState);
+            const xkb_keysym_t* syms   = nullptr;
+            const int           N      = KEYMAP ? xkb_keymap_key_get_syms_by_level(KEYMAP, CODE, xkb_state_key_get_layout(KEEB->m_xkbState, CODE), 0, &syms) : 0;
+            return N > 0 ? xkb_keysym_to_lower(syms[0]) : XKB_KEY_NoSymbol;
+        }
+
         // the chord's part a keycode is: 1-4 a modifier, 5 its key, 0 none
         int chordPart(const SZoomChord& C, uint32_t keycode) {
-            if (C.super && (keycode == 125 || keycode == 126)) // LEFTMETA, RIGHTMETA
+            const auto SYM = symOf(keycode);
+            if (C.super && (SYM == XKB_KEY_Super_L || SYM == XKB_KEY_Super_R || SYM == XKB_KEY_Meta_L || SYM == XKB_KEY_Meta_R || SYM == XKB_KEY_Hyper_L || SYM == XKB_KEY_Hyper_R))
                 return 1;
-            if (C.alt && (keycode == 56 || keycode == 100)) // LEFTALT, RIGHTALT
+            if (C.alt && (SYM == XKB_KEY_Alt_L || SYM == XKB_KEY_Alt_R))
                 return 2;
-            if (C.ctrl && (keycode == 29 || keycode == 97)) // LEFTCTRL, RIGHTCTRL
+            if (C.ctrl && (SYM == XKB_KEY_Control_L || SYM == XKB_KEY_Control_R))
                 return 3;
-            if (C.shift && (keycode == 42 || keycode == 54)) // LEFTSHIFT, RIGHTSHIFT
+            if (C.shift && (SYM == XKB_KEY_Shift_L || SYM == XKB_KEY_Shift_R))
                 return 4;
-            if (C.sym != XKB_KEY_NoSymbol) {
-                const auto KEEB = g_pSeatManager ? g_pSeatManager->m_keyboard.lock() : nullptr;
-                if (KEEB && KEEB->m_xkbState && xkb_keysym_to_lower(xkb_state_key_get_one_sym(KEEB->m_xkbState, keycode + 8)) == C.sym)
-                    return 5;
-            }
+            if (C.sym != XKB_KEY_NoSymbol && SYM == C.sym)
+                return 5;
             return 0;
         }
 

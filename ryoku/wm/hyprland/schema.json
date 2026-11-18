@@ -2772,7 +2772,7 @@
   },
   {
     "tab": "Hyprdrive",
-    "group": "SWITCHING DESKTOPS",
+    "group": "SHORTCUTS",
     "key": "wm.hyprland.plugins.hyprdrive.config.hyprdrive:binds:scroll_desktops_smooth",
     "label": "Smooth wheel",
     "desc": "The desktops follow the wheel continuously and settle on the nearest",

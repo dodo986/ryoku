@@ -5,6 +5,7 @@ import Ryoku.Ui.Singletons
 import ".."
 import "../Singletons"
 import "../components"
+import "../components/hyprdrive"
 import "../schema/hyprdrive.js" as Schema
 
 // Hyprdrive: its switch, every shortcut it would add with the Ryoku one it would take
@@ -31,7 +32,7 @@ Item {
             lead: Schema.lead,
             sections: Schema.sections,
             related: Schema.related,
-            rows: Schema.rows.concat(binds.map(Schema.bindRow))
+            rows: Schema.rows.concat(binds.map(b => Object.assign(Schema.bindRow(b, root.status), { component: bindControl })))
         };
     }
 
@@ -46,8 +47,36 @@ Item {
         return line;
     }
 
+    // what turning Hyprdrive on does to the keyboard, said before it happens: every
+    // shortcut it adds, every Ryoku one it replaces, and the ones still waiting
+    function enableWarning() {
+        var binds = (root.status && root.status.binds) || [];
+        var keys = b => (b.chords || []).length > 0 ? " (" + b.chords.map(Schema.chordText).join(", ") + ")"
+                                                      : Schema.fixedKeys[b.id] ? " (" + Schema.fixedKeys[b.id] + ")" : "";
+        var adds = binds.filter(b => b.on).map(b => b.label + keys(b));
+        var over = [];
+        binds.filter(b => b.on).forEach(b => (b.conflicts || []).forEach(c => over.push(Schema.chordText(c.chord) + " (" + c.label + ")")));
+        var waiting = binds.filter(b => !b.on && (b.conflicts || []).length > 0).length;
+        var parts = [I18n.tr("Hyprdrive overrides keyboard shortcuts while it is on.")];
+        if (adds.length > 0)
+            parts.push(I18n.tr("It adds: %1.").arg(adds.join("; ")));
+        parts.push(over.length > 0 ? I18n.tr("It replaces these Ryoku shortcuts: %1.").arg(over.join(", "))
+                                   : I18n.tr("As your shortcuts stand, it replaces none of Ryoku's."));
+        if (waiting > 0)
+            parts.push(waiting === 1 ? I18n.tr("One more would replace a Ryoku shortcut and stays off until you turn it on.")
+                                     : I18n.tr("%1 more would replace Ryoku shortcuts and stay off until you turn them on.").arg(waiting));
+        parts.push(I18n.tr("Change the keys or turn any of them off under Shortcuts; turning Hyprdrive off gives every shortcut back."));
+        return parts.join(" ");
+    }
+
+    // the switch asks before it turns Hyprdrive on
+    function adapt(rows) {
+        return rows.map(r => r.id === "plugins-hyprdrive-enabled" ? Object.assign({}, r, { control: "custom", component: enableToggle }) : r);
+    }
+
     SettingsPage {
         id: page
+        adaptRows: rows => root.adapt(rows)
         anchors.fill: parent
         hub: root.hub
         pageId: "hyprdrive"
@@ -86,10 +115,45 @@ Item {
     }
 
     Component {
+        id: bindControl
+        BindControl {}
+    }
+
+    Component {
+        id: enableToggle
+        Toggle {
+            id: toggle
+            property var row: null
+            property var value: undefined
+            property var commit: null
+            checked: toggle.value === true
+            Accessible.name: I18n.tr("Hyprdrive")
+            function activate() {
+                toggle.toggle();
+                toggle.toggled();
+            }
+            onToggled: {
+                const want = toggle.checked;
+                toggle.checked = Qt.binding(() => toggle.value === true);
+                if (!want) {
+                    toggle.commit(false);
+                    return;
+                }
+                root.hub.confirm({
+                    title: I18n.tr("Turn on Hyprdrive?"),
+                    text: root.enableWarning(),
+                    actionText: I18n.tr("Turn on"),
+                    destructive: false
+                }, () => toggle.commit(true), null);
+            }
+        }
+    }
+
+    Component {
         id: keysLead
         Label {
             width: parent ? parent.width : 0
-            text: I18n.tr("Each shortcut Hyprdrive adds, with the Ryoku shortcut it would replace. One that replaces a Ryoku shortcut stays off until you turn it on; turning Hyprdrive off gives every one back.")
+            text: I18n.tr("Every shortcut Hyprdrive adds, and the Ryoku shortcut it would replace. Click a field and press new keys to change one; clearing it gives the shipped keys back. One that would replace a Ryoku shortcut stays off until you turn it on, and turning Hyprdrive off gives every shortcut back.")
             typeRole: "detail"
             inkRole: "fg2"
             wrapMode: Text.Wrap

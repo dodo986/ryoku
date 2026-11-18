@@ -20,6 +20,7 @@ var table = {
     "plugins|Extra borders|*": ["window-style", "borders"],
     "plugins|Focus flash|*": ["animations", "focus-flash"],
     "plugins|Hyprdrive|HYPRDRIVE": ["hyprdrive", "on"],
+    "plugins|Hyprdrive|SHORTCUTS": ["hyprdrive", "keys"],
     "plugins|Hyprdrive|OVERVIEW": ["hyprdrive", "overview"],
     "plugins|Hyprdrive|HOT CORNER": ["hyprdrive", "hot-corner"],
     "plugins|Hyprdrive|SEARCH": ["hyprdrive", "search"],

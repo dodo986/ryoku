@@ -172,6 +172,10 @@ type hdBindStatus struct {
 	Conflicts []hdConflict `json:"conflicts"`
 	On        bool         `json:"on"`
 	Decided   bool         `json:"decided"`
+	// Default is the chords it ships with; Recordable, whether its one chord is a
+	// keyboard chord the page can record a new one for
+	Default    []string `json:"default"`
+	Recordable bool     `json:"recordable"`
 }
 
 // hdStatus is `ryoku-wm-hyprland hyprdrive status`.
@@ -181,6 +185,9 @@ type hdStatus struct {
 	Loaded    bool           `json:"loaded"`
 	Binds     []hdBindStatus `json:"binds"`
 	TakesOver []hdConflict   `json:"takesOver"`
+	// Taken is every chord Ryoku binds now, so a chord the page records can be
+	// refused before it takes one over
+	Taken []hdConflict `json:"taken"`
 }
 
 func runHyprdrive(args []string) error {
@@ -257,11 +264,21 @@ func hyprdriveStatus(o Overrides) hdStatus {
 		if conflicts == nil {
 			conflicts = []hdConflict{}
 		}
-		st.Binds = append(st.Binds, hdBindStatus{ID: b.ID, Label: b.Label, Detail: b.Detail, Chords: chords, Conflicts: conflicts, On: on, Decided: decided})
+		def := b.Chords
+		if def == nil {
+			def = []string{}
+		}
+		recordable := len(b.Chords) == 1 && !strings.Contains(strings.ToLower(b.Chords[0]), "mouse")
+		st.Binds = append(st.Binds, hdBindStatus{ID: b.ID, Label: b.Label, Detail: b.Detail, Chords: chords, Conflicts: conflicts, On: on, Decided: decided, Default: def, Recordable: recordable})
 		if on {
 			st.TakesOver = append(st.TakesOver, conflicts...)
 		}
 	}
+	st.Taken = []hdConflict{}
+	for chord, label := range taken {
+		st.Taken = append(st.Taken, hdConflict{Chord: chord, Label: label})
+	}
+	sort.Slice(st.Taken, func(i, j int) bool { return st.Taken[i].Chord < st.Taken[j].Chord })
 	return st
 }
 
@@ -271,7 +288,7 @@ func hyprdriveBindDefaults(o Overrides) map[string]bool {
 	taken := ryokuChordLabels(o)
 	out := make(map[string]bool, len(hyprdriveBinds))
 	for _, b := range hyprdriveBinds {
-		out[b.ID] = len(b.conflictsOf(o.Plugins.Hyprdrive, taken)) == 0
+		out[b.ID], _ = bindOn(Hyprdrive{Chords: o.Plugins.Hyprdrive.Chords}, b, b.conflictsOf(o.Plugins.Hyprdrive, taken))
 	}
 	return out
 }

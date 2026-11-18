@@ -275,3 +275,24 @@ func TestShippedShortcutDefaults(t *testing.T) {
 func hyprdriveDefaultsOverride() Hyprdrive {
 	return Hyprdrive{Config: hyprdriveDefaults()}
 }
+
+// A chord recorded on the Hyprdrive page replaces the shipped one in the block,
+// and the block frees that chord, not the old one.
+func TestRecordedChordReplacesTheShippedOne(t *testing.T) {
+	withHyprdriveCopy(t)
+	o := defaultOverrides()
+	o.Plugins.Hyprdrive.Enabled = true
+	o.Plugins.Hyprdrive.Binds = map[string]bool{"layout-cycle": true}
+	o.Plugins.Hyprdrive.Chords = map[string]string{"layout-cycle": "SUPER + ALT + M"}
+	s := genHyprdriveBlock(o)
+	if !strings.Contains(s, `hl.bind("SUPER + ALT + M"`) || !strings.Contains(s, `hl.unbind("SUPER + ALT + M")`) {
+		t.Fatalf("the recorded chord is not bound:\n%s", s)
+	}
+	if strings.Contains(s, `"SUPER + SHIFT + L"`) {
+		t.Fatalf("the shipped chord is still in the block:\n%s", s)
+	}
+	o.Plugins.Hyprdrive.Chords = map[string]string{"layout-cycle": ""}
+	if s := genHyprdriveBlock(o); !strings.Contains(s, `hl.bind("SUPER + SHIFT + L"`) {
+		t.Fatalf("a cleared chord should give the shipped one back:\n%s", s)
+	}
+}

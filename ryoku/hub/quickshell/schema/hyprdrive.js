@@ -7,7 +7,7 @@ var lead = "An overview of every window, Mosaic layouts and smooth window motion
 // builds from what Hyprdrive would bind and what each would take over
 var sections = [
     { id: "on", title: "Hyprdrive" },
-    { id: "keys", title: "Shortcuts it adds" },
+    { id: "keys", title: "Shortcuts" },
     { id: "overview", title: "Overview" },
     { id: "hot-corner", title: "Hot corner" },
     { id: "search", title: "Search" },
@@ -37,13 +37,14 @@ function chordText(chord) {
     }).join("+");
 }
 
-// one shortcut row from the window manager's status: its keys, and the Ryoku shortcut it
-// would take over. One that takes another over is off until you turn it on.
-function bindRow(b) {
-    var keys = (b.chords || []).map(chordText).join(", ");
+// the keys of a shortcut that cannot be recorded: Super alone, the swipe, the wheel
+var fixedKeys = { "tap-super": "Tap Super", "swipe-overview": "Three fingers up" };
+
+// one shortcut row from the window manager's status: a field for its keys (BindControl)
+// and the Ryoku shortcut it would take over. One that takes another over is off until
+// you turn it on. `status` is the whole answer, for the chords already taken.
+function bindRow(b, status) {
     var detail = b.detail;
-    if (keys.length > 0)
-        detail = keys + ". " + detail;
     var over = (b.conflicts || []).map(function (c) {
         return chordText(c.chord) + " (" + c.label + ")";
     });
@@ -51,8 +52,10 @@ function bindRow(b) {
         detail += ". Takes over " + over.join(" and ") + " from Ryoku";
     return {
         id: "bind-" + b.id, section: "keys", label: b.label, detail: detail,
-        keywords: ["shortcut", "keybind", "takes over", "conflict"].concat((b.chords || []).map(chordText)),
-        control: "toggle", bind: d("wm.hyprland.plugins.hyprdrive.binds." + b.id), "default": b.on === true,
+        keywords: ["shortcut", "keybind", "keys", "takes over", "conflict"].concat((b.chords || []).map(chordText)),
+        control: "custom", bind: d("wm.hyprland.plugins.hyprdrive.binds." + b.id), "default": b.on === true,
+        hd: b, taken: (status && status.taken) || [], others: (status && status.binds) || [],
+        keysText: fixedKeys[b.id] || (b.chords || []).map(chordText).join(", "),
         takesOver: over.length > 0
     };
 }

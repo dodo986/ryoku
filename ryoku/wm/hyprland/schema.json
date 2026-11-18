@@ -2511,36 +2511,6 @@
   {
     "tab": "Hyprdrive",
     "group": "INFINITE CANVAS",
-    "key": "wm.hyprland.plugins.hyprdrive.config.hyprdrive:mosaic:super_zoom_distance",
-    "label": "Distance before zooming",
-    "desc": "How far the pointer moves with the zoom key held before the canvas zooms out; further makes an accidental zoom rarer",
-    "ctl": "step",
-    "src": "desktop.json",
-    "caps": "hyprdrive",
-    "page": "plugins",
-    "lo": 8,
-    "hi": 400,
-    "unit": "px",
-    "adv": true,
-    "keywords": "super zoom distance",
-    "when": {
-      "wm.hyprland.plugins.hyprdrive.enabled": [
-        true
-      ],
-      "wm.hyprland.plugins.hyprdrive.config.hyprdrive:mosaic:enabled": [
-        true
-      ],
-      "wm.hyprland.plugins.hyprdrive.config.hyprdrive:mosaic:infinite_canvas": [
-        true
-      ],
-      "wm.hyprland.plugins.hyprdrive.config.hyprdrive:mosaic:super_zoom": [
-        true
-      ]
-    }
-  },
-  {
-    "tab": "Hyprdrive",
-    "group": "INFINITE CANVAS",
     "key": "wm.hyprland.plugins.hyprdrive.config.hyprdrive:mosaic:edge_push",
     "label": "Push past the edge",
     "desc": "Pushing the pointer firmly against a screen edge slides the canvas to the windows past it",
@@ -2769,7 +2739,7 @@
     "group": "SHORTCUTS",
     "key": "wm.hyprland.plugins.hyprdrive.config.hyprdrive:mosaic:super_zoom",
     "label": "Zoom out on the canvas",
-    "desc": "Hold the key and move the pointer to see every window on the infinite canvas; let go to zoom back in. Three fingers down zoom out either way",
+    "desc": "Hold the keys to see every window on the infinite canvas at once; let go to zoom back in on the window under the pointer. Three fingers down zoom out too",
     "ctl": "sw",
     "src": "desktop.json",
     "caps": "hyprdrive",

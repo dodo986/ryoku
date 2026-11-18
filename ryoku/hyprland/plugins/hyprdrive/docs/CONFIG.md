@@ -116,7 +116,7 @@ Prefix: `plugin:hyprdrive:mosaic:`
 | `edge_push_resistance` | int | `400` | 50 .. 1500 | mosaic: how far (px) the pointer must keep pushing into the edge before the canvas gives way (the bottom edge takes half again as much); lower = easier |
 | `canvas_directions` | string | `"all"` |  | mosaic: the infinite canvas grows horizontal (a strip) or all (a grid); on either, three fingers down (or Super and a pointer move, with mosaic:super_zoom) zoom out to every window, hover one to focus it |
 | `super_zoom` | bool | `true` |  | mosaic: on the infinite canvas, holding Super and moving the pointer zooms out to every window (three fingers down zoom out either way) |
-| `zoom_key` | string | `"super"` |  | mosaic: the key held for the canvas zoom (and the titles it shows): super, alt, ctrl or shift |
+| `zoom_key` | string | `"SUPER + ALT"` |  | mosaic: the chord held for the canvas zoom (and the titles it shows): modifiers, a key or both, such as SUPER + ALT, SUPER + Z or F13; it zooms out the moment it is held |
 | `super_zoom_distance` | int | `32` | 8 .. 400 | mosaic: how far (px) the pointer moves with Super held before the canvas zooms out and the titles show |
 | `canvas_super_move` | string | `"zoom"` |  | mosaic: retired and ignored (see mosaic:super_zoom) |
 | `zoom_labels` | string | `"hover"` |  | window titles while Super is held and the pointer moves, on any desktop (the zoomed-out canvas too): none, hover (the window under the pointer) or all |

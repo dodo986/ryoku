@@ -5,6 +5,10 @@
 #include "MosaicParts.hpp"
 #include "MotionTimings.hpp"
 #include "MotionClock.hpp"
+#include <xkbcommon/xkbcommon.h>
+#include <set>
+#include <sstream>
+#include <hyprland/src/devices/IKeyboard.hpp>
 
 
 // main.cpp: Super held to pan the canvas is not a Super tap.
@@ -267,31 +271,89 @@ namespace Hyprdrive::Mosaic {
         armSlideWatch();
     }
 
-    // super (the default), alt, ctrl or shift
-    static std::string zoomKey() {
-        return Hyprdrive::Config::getValue<std::string>("plugin:hyprdrive:mosaic:zoom_key");
+    // THE ZOOM CHORD (mosaic:zoom_key): any chord, "SUPER + ALT" by default --
+    // modifiers alone, or modifiers and a key, or a key alone. Followed from the
+    // raw key stream (onKey), as the keys go down and up; the zoom engages the
+    // moment the whole chord is held.
+    namespace {
+        struct SZoomChord {
+            bool         super = false, alt = false, ctrl = false, shift = false;
+            xkb_keysym_t sym   = XKB_KEY_NoSymbol;
+            bool         valid = false;
+        };
+        SZoomChord         g_chord;
+        std::string        g_chordText = "\x01"; // nothing parsed yet
+        std::set<uint32_t> g_chordDown;          // the chord's keys held now
+        bool               g_chordHeld = false;
+
+        const SZoomChord& zoomChord() {
+            const auto TEXT = Hyprdrive::Config::getValue<std::string>("plugin:hyprdrive:mosaic:zoom_key");
+            if (TEXT == g_chordText)
+                return g_chord;
+            g_chordText = TEXT;
+            g_chord     = {};
+            std::stringstream in(TEXT);
+            std::string       part;
+            bool              any = false;
+            while (std::getline(in, part, '+')) {
+                const auto B = part.find_first_not_of(" \t"), E = part.find_last_not_of(" \t");
+                if (B == std::string::npos)
+                    continue;
+                part = part.substr(B, E - B + 1);
+                std::string up = part;
+                for (auto& c : up)
+                    c = sc<char>(std::toupper(sc<unsigned char>(c)));
+                if (up == "SUPER" || up == "META" || up == "WIN" || up == "LOGO" || up == "MOD4")
+                    g_chord.super = true;
+                else if (up == "ALT" || up == "MOD1")
+                    g_chord.alt = true;
+                else if (up == "CTRL" || up == "CONTROL")
+                    g_chord.ctrl = true;
+                else if (up == "SHIFT")
+                    g_chord.shift = true;
+                else {
+                    const auto SYM = xkb_keysym_from_name(part.c_str(), XKB_KEYSYM_CASE_INSENSITIVE);
+                    if (SYM == XKB_KEY_NoSymbol)
+                        return g_chord; // a key xkb does not know: no chord
+                    g_chord.sym = xkb_keysym_to_lower(SYM);
+                }
+                any = true;
+            }
+            g_chord.valid = any;
+            g_chordDown.clear();
+            g_chordHeld = false;
+            return g_chord;
+        }
+
+        // the chord's part a keycode is: 1-4 a modifier, 5 its key, 0 none
+        int chordPart(const SZoomChord& C, uint32_t keycode) {
+            if (C.super && (keycode == 125 || keycode == 126)) // LEFTMETA, RIGHTMETA
+                return 1;
+            if (C.alt && (keycode == 56 || keycode == 100)) // LEFTALT, RIGHTALT
+                return 2;
+            if (C.ctrl && (keycode == 29 || keycode == 97)) // LEFTCTRL, RIGHTCTRL
+                return 3;
+            if (C.shift && (keycode == 42 || keycode == 54)) // LEFTSHIFT, RIGHTSHIFT
+                return 4;
+            if (C.sym != XKB_KEY_NoSymbol) {
+                const auto KEEB = g_pSeatManager ? g_pSeatManager->m_keyboard.lock() : nullptr;
+                if (KEEB && KEEB->m_xkbState && xkb_keysym_to_lower(xkb_state_key_get_one_sym(KEEB->m_xkbState, keycode + 8)) == C.sym)
+                    return 5;
+            }
+            return 0;
+        }
+
+        bool chordComplete(const SZoomChord& C) {
+            bool parts[6] = {};
+            for (const auto K : g_chordDown)
+                parts[chordPart(C, K)] = true;
+            return C.valid && (!C.super || parts[1]) && (!C.alt || parts[2]) && (!C.ctrl || parts[3]) && (!C.shift || parts[4]) &&
+                (C.sym == XKB_KEY_NoSymbol || parts[5]);
+        }
     }
 
-    int zoomMask() {
-        const auto K = zoomKey();
-        if (K == "alt")
-            return sc<int>(HL_MODIFIER_ALT);
-        if (K == "ctrl")
-            return sc<int>(HL_MODIFIER_CTRL);
-        if (K == "shift")
-            return sc<int>(HL_MODIFIER_SHIFT);
-        return META_MASK;
-    }
-
-    bool isZoomKey(uint32_t keycode) {
-        const auto K = zoomKey();
-        if (K == "alt")
-            return keycode == 56 || keycode == 100; // LEFTALT, RIGHTALT
-        if (K == "ctrl")
-            return keycode == 29 || keycode == 97; // LEFTCTRL, RIGHTCTRL
-        if (K == "shift")
-            return keycode == 42 || keycode == 54; // LEFTSHIFT, RIGHTSHIFT
-        return keycode == 125 || keycode == 126; // LEFTMETA, RIGHTMETA
+    bool zoomChordHeld() {
+        return g_chordHeld;
     }
 
     void onSuperKey(bool pressed) {
@@ -303,6 +365,60 @@ namespace Hyprdrive::Mosaic {
             return;
         }
         superEnd(false);
+    }
+
+    // The zoom out, now: the canvas under the pointer, when it is wider than the
+    // screen. False when there is nothing to zoom (no canvas, or it fits).
+    static bool engageZoom() {
+        if (g_super != ESuper::ARMED || !superZoomOn() || g_cursorRiding || (g_layoutManager && g_layoutManager->dragController()->target()))
+            return false;
+        const Vector2D P   = g_pInputManager->getMouseCoordsInternal();
+        const auto     MON = State::monitorState()->query().vec(P).run();
+        if (!MON || openScrollOverviewForMonitor(MON) || MON->m_activeSpecialWorkspace)
+            return false;
+        auto*      A = canvasOf(MON->m_activeWorkspace);
+        const auto V = A ? A->canvasViewNow() : std::nullopt;
+        if (!V || (V->maxX <= 1.0 && V->maxY <= 1.0) || !A->zoomOut())
+            return false;
+        g_super       = ESuper::ZOOMED;
+        g_superCanvas = A;
+        // The window under the pointer at full size lets go of it
+        // (zoomOwnsPointer: no motion reaches the clients while zoomed).
+        g_pSeatManager->setPointerFocus(nullptr, {});
+        g_canvasPanning = true;
+        // The chord was held for this, not Super tapped: no overview on release.
+        Hyprdrive::cancelSuperTap();
+        g_superLabels = true;
+        g_pHyprRenderer->damageMonitor(MON);
+        return true;
+    }
+
+    void onKey(uint32_t keycode, bool pressed) {
+        const auto& C = zoomChord();
+        if (!C.valid)
+            return;
+        const int PART = chordPart(C, keycode);
+        if (PART == 0) {
+            // Another key with the chord held: someone's shortcut (Super+Alt+3
+            // moves a window), not this. The zoom goes back in and the chord is
+            // spent until it is let go.
+            if (pressed && g_chordHeld && (g_super == ESuper::ARMED || g_super == ESuper::ZOOMED))
+                superEnd(true);
+            return;
+        }
+        if (pressed)
+            g_chordDown.insert(keycode);
+        else
+            g_chordDown.erase(keycode);
+        const bool HELD = chordComplete(C);
+        if (HELD && !g_chordHeld) {
+            g_chordHeld = true;
+            onSuperKey(true);
+            engageZoom();
+        } else if (!HELD && g_chordHeld) {
+            g_chordHeld = false;
+            onSuperKey(false);
+        }
     }
 
     // AN OVERVIEW OPENS, THE ZOOM ENDS (2026-11-09). The fingers' zoom stays
@@ -841,26 +957,13 @@ namespace Hyprdrive::Mosaic {
                 Desktop::focusState()->fullWindowFocus(W, Desktop::FOCUS_REASON_FFM);
             return;
         }
-        const int MODS = modsNow();
-        if (!(MODS & zoomMask())) {
+        // The zoom chord (onKey) decides: not held, nothing of it stays.
+        if (!g_chordHeld) {
             if (g_super != ESuper::IDLE)
                 superEnd(false);
             return;
         }
-        if (MODS != zoomMask()) {
-            // Another modifier joined: someone's chord, not this. Zoomed out,
-            // the view stays until Super is let go: Super+Shift+S takes a
-            // screenshot of the zoomed-out canvas, not of the view behind it.
-            if (g_super != ESuper::IDLE && g_super != ESuper::SPENT && g_super != ESuper::ZOOMED)
-                superEnd(true);
-            return;
-        }
         const Vector2D P = g_pInputManager->getMouseCoordsInternal();
-        if (g_super == ESuper::IDLE) {
-            // Super went down before we heard it (held across a reload).
-            g_super       = ESuper::ARMED;
-            g_superAnchor = P;
-        }
         if (g_super == ESuper::SPENT || blocked || g_cursorRiding || (g_layoutManager && g_layoutManager->dragController()->target()))
             return;
         const auto MON = State::monitorState()->query().vec(P).run();
@@ -897,19 +1000,9 @@ namespace Hyprdrive::Mosaic {
             return;
 
         if (g_super == ESuper::ARMED) {
-            const Vector2D D = P - g_superAnchor;
-            if (D.x * D.x + D.y * D.y < superSlop() * superSlop() || !superZoomOn())
+            // the canvas grew past the screen with the chord held: zoom now
+            if (!engageZoom())
                 return;
-            if (!A->zoomOut())
-                return;
-            g_super       = ESuper::ZOOMED;
-            g_superCanvas = A;
-            // The window under the pointer at full size lets go of it
-            // (zoomOwnsPointer: no motion reaches the clients while zoomed).
-            g_pSeatManager->setPointerFocus(nullptr, {});
-            g_canvasPanning = true;
-            // Super was held for this, not tapped: no overview on its release.
-            Hyprdrive::cancelSuperTap();
         }
 
         if (g_super == ESuper::ZOOMED && g_zoomPressing) {

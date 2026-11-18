@@ -267,6 +267,33 @@ namespace Hyprdrive::Mosaic {
         armSlideWatch();
     }
 
+    // super (the default), alt, ctrl or shift
+    static std::string zoomKey() {
+        return Hyprdrive::Config::getValue<std::string>("plugin:hyprdrive:mosaic:zoom_key");
+    }
+
+    int zoomMask() {
+        const auto K = zoomKey();
+        if (K == "alt")
+            return sc<int>(HL_MODIFIER_ALT);
+        if (K == "ctrl")
+            return sc<int>(HL_MODIFIER_CTRL);
+        if (K == "shift")
+            return sc<int>(HL_MODIFIER_SHIFT);
+        return META_MASK;
+    }
+
+    bool isZoomKey(uint32_t keycode) {
+        const auto K = zoomKey();
+        if (K == "alt")
+            return keycode == 56 || keycode == 100; // LEFTALT, RIGHTALT
+        if (K == "ctrl")
+            return keycode == 29 || keycode == 97; // LEFTCTRL, RIGHTCTRL
+        if (K == "shift")
+            return keycode == 42 || keycode == 54; // LEFTSHIFT, RIGHTSHIFT
+        return keycode == 125 || keycode == 126; // LEFTMETA, RIGHTMETA
+    }
+
     void onSuperKey(bool pressed) {
         if (pressed) {
             if (g_super == ESuper::IDLE) {
@@ -815,12 +842,12 @@ namespace Hyprdrive::Mosaic {
             return;
         }
         const int MODS = modsNow();
-        if (!(MODS & META_MASK)) {
+        if (!(MODS & zoomMask())) {
             if (g_super != ESuper::IDLE)
                 superEnd(false);
             return;
         }
-        if (MODS != META_MASK) {
+        if (MODS != zoomMask()) {
             // Another modifier joined: someone's chord, not this. Zoomed out,
             // the view stays until Super is let go: Super+Shift+S takes a
             // screenshot of the zoomed-out canvas, not of the view behind it.

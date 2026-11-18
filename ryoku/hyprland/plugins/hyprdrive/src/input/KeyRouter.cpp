@@ -51,6 +51,12 @@ void                registerRawKeyHooks() {
         const bool PRESSED = event.state == WL_KEYBOARD_KEY_STATE_PRESSED;
         const bool ISSUPER = event.keycode == EVDEV_KEY_LEFTMETA || event.keycode == EVDEV_KEY_RIGHTMETA;
 
+        // The infinite canvas's zoom gesture (Mosaic.hpp), on the key set for it
+        // (mosaic:zoom_key, Super by default): armed on the press, over on the
+        // release -- zoomed out, the release zooms back in.
+        if (Hyprdrive::Mosaic::isZoomKey(event.keycode))
+            Hyprdrive::Mosaic::onSuperKey(PRESSED);
+
         if (isGuardModifierKeycode(event.keycode)) {
             if (PRESSED)
                 g_heldGuardKeys.insert(event.keycode);
@@ -233,10 +239,6 @@ void                registerRawKeyHooks() {
             }
             return;
         }
-
-        // The infinite canvas's Super gesture (Mosaic.hpp): armed on the press,
-        // over on the release -- zoomed out, the release zooms back in.
-        Hyprdrive::Mosaic::onSuperKey(PRESSED);
 
         if (PRESSED) {
             g_tapSuperCandidate = true;

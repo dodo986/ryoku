@@ -109,6 +109,7 @@ func hyprdriveDefaults() map[string]any {
 		"hyprdrive:mosaic:infinite_canvas":              true,
 		"hyprdrive:mosaic:canvas_directions":            "all",
 		"hyprdrive:mosaic:super_zoom":                   true,
+		"hyprdrive:mosaic:zoom_key":                     "super",
 		"hyprdrive:mosaic:super_zoom_distance":          32.0,
 		"hyprdrive:mosaic:spawn_at_cursor":              true,
 		"hyprdrive:mosaic:quiet_new_windows":            true,

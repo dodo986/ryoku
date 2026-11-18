@@ -2511,32 +2511,9 @@
   {
     "tab": "Hyprdrive",
     "group": "INFINITE CANVAS",
-    "key": "wm.hyprland.plugins.hyprdrive.config.hyprdrive:mosaic:super_zoom",
-    "label": "Zoom out with Super",
-    "desc": "Hold Super and move the pointer to see every window on the canvas; let go to zoom back in. Off, Super+drag and shortcuts never zoom; three fingers down still do",
-    "ctl": "sw",
-    "src": "desktop.json",
-    "caps": "hyprdrive",
-    "page": "plugins",
-    "keywords": "super zoom canvas hold",
-    "when": {
-      "wm.hyprland.plugins.hyprdrive.enabled": [
-        true
-      ],
-      "wm.hyprland.plugins.hyprdrive.config.hyprdrive:mosaic:enabled": [
-        true
-      ],
-      "wm.hyprland.plugins.hyprdrive.config.hyprdrive:mosaic:infinite_canvas": [
-        true
-      ]
-    }
-  },
-  {
-    "tab": "Hyprdrive",
-    "group": "INFINITE CANVAS",
     "key": "wm.hyprland.plugins.hyprdrive.config.hyprdrive:mosaic:super_zoom_distance",
     "label": "Distance before zooming",
-    "desc": "How far the pointer moves with Super held before the canvas zooms out; further makes an accidental zoom rarer",
+    "desc": "How far the pointer moves with the zoom key held before the canvas zooms out; further makes an accidental zoom rarer",
     "ctl": "step",
     "src": "desktop.json",
     "caps": "hyprdrive",
@@ -2781,6 +2758,23 @@
     "caps": "hyprdrive",
     "page": "plugins",
     "keywords": "scroll wheel",
+    "when": {
+      "wm.hyprland.plugins.hyprdrive.enabled": [
+        true
+      ]
+    }
+  },
+  {
+    "tab": "Hyprdrive",
+    "group": "SHORTCUTS",
+    "key": "wm.hyprland.plugins.hyprdrive.config.hyprdrive:mosaic:super_zoom",
+    "label": "Zoom out on the canvas",
+    "desc": "Hold the key and move the pointer to see every window on the infinite canvas; let go to zoom back in. Three fingers down zoom out either way",
+    "ctl": "sw",
+    "src": "desktop.json",
+    "caps": "hyprdrive",
+    "page": "plugins",
+    "keywords": "super zoom canvas hold key alt ctrl shift",
     "when": {
       "wm.hyprland.plugins.hyprdrive.enabled": [
         true

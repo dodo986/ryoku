@@ -69,6 +69,10 @@ namespace Hyprdrive::Mosaic {
     // gesture -- hold and move to zoom out,
     // never while a Super+click or Super+drag has used the press.
     void onSuperKey(bool pressed);
+    // The key held for the canvas zoom (mosaic:zoom_key): its modifier mask, and
+    // whether a keycode is that key, left or right.
+    int  zoomMask();
+    bool isZoomKey(uint32_t keycode);
     // An overview is opening (COverview's constructor and reopen(), the
     // two doors every overview comes through): a zoomed-out canvas ends, as
     // when Super is let go.

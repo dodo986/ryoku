@@ -163,6 +163,8 @@ static void registerConfigValuesFor() {
     addKey(makeShared<CBoolValue>(KEY("mosaic:super_zoom"),
                                   "mosaic: on the infinite canvas, holding Super and moving the pointer zooms out to every window (three fingers down zoom out either way)",
                                   true));
+    addKey(makeShared<CStringValue>(KEY("mosaic:zoom_key"),
+                                    "mosaic: the key held for the canvas zoom (and the titles it shows): super, alt, ctrl or shift", Hyprlang::STRING{"super"}));
     addKey(makeShared<CIntValue>(KEY("mosaic:super_zoom_distance"),
                                  "mosaic: how far (px) the pointer moves with Super held before the canvas zooms out and the titles show", 32,
                                  SIntValueOptions{.min = 8, .max = 400}));

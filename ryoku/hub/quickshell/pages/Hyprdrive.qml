@@ -62,6 +62,12 @@ Item {
             parts.push(I18n.tr("It adds: %1.").arg(adds.join("; ")));
         parts.push(over.length > 0 ? I18n.tr("It replaces these Ryoku shortcuts: %1.").arg(over.join(", "))
                                    : I18n.tr("As your shortcuts stand, it replaces none of Ryoku's."));
+        // the canvas zoom changes what holding a key does
+        var cfg = k => Changes.value({ store: "desktop", key: "wm.hyprland.plugins.hyprdrive.config.hyprdrive:" + k });
+        if (cfg("mosaic:super_zoom") === true && cfg("mosaic:infinite_canvas") === true) {
+            var held = { alt: "Alt", ctrl: "Ctrl", shift: "Shift" }[cfg("mosaic:zoom_key")] || "Super";
+            parts.push(I18n.tr("On the infinite canvas, holding %1 and moving the pointer zooms out.").arg(held));
+        }
         if (waiting > 0)
             parts.push(waiting === 1 ? I18n.tr("One more would replace a Ryoku shortcut and stays off until you turn it on.")
                                      : I18n.tr("%1 more would replace Ryoku shortcuts and stay off until you turn them on.").arg(waiting));
@@ -71,7 +77,14 @@ Item {
 
     // the switch asks before it turns Hyprdrive on
     function adapt(rows) {
-        return rows.map(r => r.id === "plugins-hyprdrive-enabled" ? Object.assign({}, r, { control: "custom", component: enableToggle }) : r);
+        return rows.map(r => {
+            if (r.id === "plugins-hyprdrive-enabled")
+                return Object.assign({}, r, { control: "custom", component: enableToggle });
+            // the canvas zoom is a shortcut: the key to hold, and Turn off / on
+            if (r.id === "plugins-hyprdrive-config-hyprdrive-mosaic-super-zoom")
+                return Object.assign({}, r, { control: "custom", component: zoomControl });
+            return r;
+        });
     }
 
     SettingsPage {
@@ -112,6 +125,11 @@ Item {
                 }
             }
         }
+    }
+
+    Component {
+        id: zoomControl
+        ZoomControl {}
     }
 
     Component {
